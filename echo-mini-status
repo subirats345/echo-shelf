@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+
+set -u
+
+plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+config_root="${XDG_CONFIG_HOME:-$HOME/.config}/echo-shelf"
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/echo-shelf"
+firmware_config="$config_root/firmware-version"
+firmware_cache="$cache_root/latest-firmware"
+firmware_url_cache="$cache_root/latest-firmware-url"
+firmware_pending="$config_root/firmware-pending"
+firmware_prepared="$config_root/firmware-prepared"
+firmware_url="https://forum.fiio.com/phoneNote/showNoteContent.do?id=202501210934383987154"
+
+mode=disconnected
+internal_device=
+internal_mount=
+sd_device=
+sd_mount=
+music_root="$(xdg-user-dir MUSIC 2>/dev/null || true)"
+[[ -n "$music_root" ]] || music_root="$HOME/Music"
+inbox="$music_root/Echo Shelf Inbox"
+library="$music_root/Echo Shelf Library"
+firmware_store="$cache_root/firmware"
+firmware_backup_root="$music_root/Echo Shelf Firmware Backups"
+
+ensure_inbox() {
+  [[ -d "$inbox" ]] || mkdir -p "$inbox"
+}
+
+open_inbox() {
+  ensure_inbox || { echo "Could not create Inbox: $inbox"; return 1; }
+  command -v xdg-open >/dev/null || { echo "Could not open Inbox"; return 1; }
+  xdg-open "$inbox" >/dev/null 2>&1 &
+  echo "Inbox opened"
+}
+
+scan_devices() {
+  local device properties model devname devtype mountpoint
+
+  for device in /sys/class/block/*; do
+    properties="$(udevadm info --query=property --path="$device" 2>/dev/null || true)"
+    grep -q '^ID_VENDOR_ID=071b$' <<<"$properties" || continue
+    grep -q '^ID_MODEL_ID=3203$' <<<"$properties" || continue
+    mode=data
+    devtype="$(sed -n 's/^DEVTYPE=//p' <<<"$properties")"
+    [[ "$devtype" == partition ]] || continue
+    model="$(sed -n 's/^ID_MODEL=//p' <<<"$properties")"
+    devname="$(sed -n 's/^DEVNAME=//p' <<<"$properties")"
+    mountpoint="$(findmnt -n -S "$devname" -o TARGET 2>/dev/null || true)"
+    if [[ "$model" == MINI ]]; then
+      internal_device="$devname"
+      internal_mount="$mountpoint"
+    elif [[ "$model" == MINI_SD ]]; then
+      sd_device="$devname"
+      sd_mount="$mountpoint"
+    fi
+  done
+
+  [[ "$mode" == data ]] && return
+
+  for device in /sys/class/sound/card*; do
+    properties="$(udevadm info --query=property --path="$device" 2>/dev/null || true)"
+    if grep -q '^ID_VENDOR_ID=071b$' <<<"$properties" \
+        && grep -q '^ID_MODEL_ID=3205$' <<<"$properties"; then
+      mode=dac
+      return
+    fi
+  done
+}
+
+valid_echo_properties() {
+  local properties="$1" expected_model="$2"
+  grep -q '^DEVTYPE=partition$' <<<"$properties" \
+    && grep -q '^ID_VENDOR_ID=071b$' <<<"$properties" \
+    && grep -q '^ID_MODEL_ID=3203$' <<<"$properties" \
+    && grep -q "^ID_MODEL=${expected_model}$" <<<"$properties"
+}
+
+valid_echo_partition() {
+  local device="$1" expected_model="$2" properties
+  [[ -b "$device" ]] || return 1
+  properties="$(udevadm info --query=property --name="$device" 2>/dev/null || true)"
+  valid_echo_properties "$properties" "$expected_model"
+}
+
+safe_eject() {
+  local device message
+  [[ "$mode" == data ]] || { echo "Echo Mini is not in USB Data mode"; return 1; }
+  [[ -n "$internal_device" ]] || { echo "Echo internal memory was not found"; return 1; }
+  valid_echo_partition "$internal_device" MINI \
+    || { echo "Internal identity check failed"; return 1; }
+  if [[ -n "$sd_device" ]]; then
+    valid_echo_partition "$sd_device" MINI_SD \
+      || { echo "SD identity check failed"; return 1; }
+  fi
+
+  for device in "$sd_device" "$internal_device"; do
+    [[ -n "$device" ]] || continue
+    if findmnt -n -S "$device" >/dev/null 2>&1; then
+      message="$(udisksctl unmount -b "$device" 2>&1)" \
+        || { echo "${message:-Could not unmount $device}"; return 1; }
+    fi
+  done
+
+  if { [[ -n "$sd_device" ]] && findmnt -n -S "$sd_device" >/dev/null 2>&1; } \
+      || findmnt -n -S "$internal_device" >/dev/null 2>&1; then
+    echo "A volume is still mounted"
+    return 1
+  fi
+
+  echo "Safe to disconnect"
+}
+
+usage() {
+  local mountpoint="$1"
+  [[ -n "$mountpoint" ]] || { echo "Not mounted"; return; }
+  df -hP "$mountpoint" | awk 'NR == 2 { print $3 " / " $2 }'
+}
+
+usage_percent() {
+  local mountpoint="$1"
+  [[ -n "$mountpoint" ]] || { echo 0; return; }
+  df -P "$mountpoint" | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }'
+}
+
+emit_progress() {
+  printf 'PROGRESS\t%s\t%s\n' "$1" "$2"
+}
+
+track_count() {
+  [[ -n "$sd_mount" ]] || { echo 0; return; }
+  find "$sd_mount" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' \
+    -o -iname '*.wav' -o -iname '*.ape' -o -iname '*.ogg' -o -iname '*.dsf' \) \
+    -printf . 2>/dev/null | wc -c | tr -d ' '
+}
+
+file_count() {
+  local pattern="$1"
+  [[ -n "$sd_mount" ]] || { echo 0; return; }
+  find "$sd_mount" -type f -iname "$pattern" -printf . 2>/dev/null | wc -c | tr -d ' '
+}
+
+category_count() {
+  [[ -n "$sd_mount" ]] || { echo 0; return; }
+  find "$sd_mount" -mindepth 1 -maxdepth 1 -type d -name '0[1-9]_*' -printf . 2>/dev/null \
+    | wc -c | tr -d ' '
+}
+
+album_count() {
+  local category total=0 count
+  [[ -n "$sd_mount" ]] || { echo 0; return; }
+  while IFS= read -r -d '' category; do
+    count="$(find "$category" -mindepth 1 -maxdepth 1 -type d -printf . 2>/dev/null \
+      | wc -c | tr -d ' ')"
+    total=$((total + count))
+  done < <(find "$sd_mount" -mindepth 1 -maxdepth 1 -type d -name '0[1-9]_*' -print0 2>/dev/null)
+  echo "$total"
+}
+
+manifest_status() {
+  [[ -n "$sd_mount" ]] || { echo "Not mounted"; return; }
+  if [[ -f "$sd_mount/00_README.txt" && -f "$sd_mount/00_SNOWSKY_ACTIVE_BATCH.csv" ]]; then
+    echo Ready
+  else
+    echo Missing
+  fi
+}
+
+cleanup_status() {
+  local count
+  count="$(file_count '._*')"
+  if [[ "$count" == 0 ]]; then
+    echo Clean
+  else
+    echo "$count AppleDouble files"
+  fi
+}
+
+file_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1"
+}
+
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
+}
+
+plugin_version() {
+  sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$plugin_dir/manifest.json" | head -n 1
+}
+
+device_status() {
+  local properties revision size variant
+  [[ -n "$internal_device" ]] || { echo "Unknown"; return; }
+  properties="$(udevadm info --query=property --name="$internal_device" 2>/dev/null || true)"
+  revision="$(sed -n 's/^ID_REVISION=//p' <<<"$properties")"
+  size="$(lsblk -bno SIZE "$internal_device" 2>/dev/null | tr -d ' ')"
+  variant=512MB
+  [[ -n "$size" ]] && ((size > 1073741824)) && variant=8GB
+  echo "$variant · rev ${revision:-unknown}"
+}
+
+version_is_older() {
+  local -a left right
+  local index left_part right_part
+  IFS=. read -ra left <<<"$1"
+  IFS=. read -ra right <<<"$2"
+  for index in 0 1 2; do
+    left_part=$((10#${left[$index]:-0}))
+    right_part=$((10#${right[$index]:-0}))
+    ((left_part < right_part)) && return 0
+    ((left_part > right_part)) && return 1
+  done
+  return 1
+}
+
+firmware_status() {
+  local installed=unknown latest=unknown pending=unknown prepared=unknown
+  [[ -f "$firmware_config" ]] && read -r installed < "$firmware_config"
+  [[ -f "$firmware_cache" ]] && read -r latest < "$firmware_cache"
+  [[ -f "$firmware_pending" ]] && read -r pending < "$firmware_pending"
+  [[ -f "$firmware_prepared" ]] && read -r prepared < "$firmware_prepared"
+  [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || installed=unknown
+  [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || latest=unknown
+  [[ "$pending" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || pending=unknown
+  [[ "$prepared" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || prepared=unknown
+  if [[ "$pending" != unknown && "$installed" != unknown ]]; then
+    echo "$installed → $pending pending confirmation"
+  elif [[ "$pending" != unknown ]]; then
+    echo "$pending pending confirmation"
+  elif [[ "$prepared" != unknown && "$installed" != unknown ]]; then
+    echo "$installed → $prepared package ready"
+  elif [[ "$prepared" != unknown ]]; then
+    echo "$prepared package ready"
+  elif [[ "$installed" == unknown ]]; then
+    echo "Installed unknown · latest $latest"
+  elif [[ "$latest" == unknown ]]; then
+    echo "$installed · latest unknown"
+  elif version_is_older "$installed" "$latest"; then
+    echo "$installed → $latest available"
+  elif [[ "$installed" == "$latest" ]]; then
+    echo "$installed · up to date"
+  else
+    echo "$installed · newer than feed"
+  fi
+}
+
+firmware_pending_status() {
+  local pending
+  [[ -f "$firmware_pending" ]] || { echo no; return; }
+  read -r pending < "$firmware_pending"
+  [[ "$pending" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo yes || echo no
+}
+
+firmware_pending_version() {
+  [[ "$(firmware_pending_status)" == yes ]] && head -n 1 "$firmware_pending" || echo unknown
+}
+
+firmware_installed_version() {
+  local version
+  [[ -f "$firmware_config" ]] || { echo unknown; return; }
+  read -r version < "$firmware_config"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$version" || echo unknown
+}
+
+firmware_backup_status() {
+  find "$firmware_backup_root" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null \
+    | grep -q . && echo yes || echo no
+}
+
+mark_firmware_pending() {
+  local version="${1:-}" latest temporary
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ -f "$firmware_cache" ]] || return 1
+  read -r latest < "$firmware_cache"
+  [[ "$version" == "$latest" ]] || return 1
+  mkdir -p "$config_root"
+  temporary="$(mktemp "$config_root/.firmware-pending.XXXXXX")"
+  printf '%s\n' "$version" > "$temporary"
+  mv "$temporary" "$firmware_pending"
+  echo "$version pending confirmation"
+}
+
+confirm_firmware() {
+  local pending
+  [[ -f "$firmware_pending" ]] || { echo "No firmware pending confirmation"; return 1; }
+  read -r pending < "$firmware_pending"
+  [[ "$pending" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "Invalid pending firmware version"; return 1; }
+  mkdir -p "$config_root"
+  mv "$firmware_pending" "$firmware_config"
+  echo "$pending installed · confirmed"
+}
+
+check_updates() {
+  local page latest download_url temporary temporary_url
+  page="$(curl -LfsS --max-time 15 "$firmware_url")" \
+    || { [[ -f "$firmware_cache" ]] && cat "$firmware_cache"; return 1; }
+  latest="$(grep -oE 'ECHO MINI[^<]{0,80}V[0-9]+\.[0-9]+\.[0-9]+' <<<"$page" \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -Vu | tail -n 1)"
+  [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  download_url="$(grep -oE "https?[^\"<> ]+V${latest}-8G\\.zip" <<<"$page" | head -n 1)"
+  [[ "$download_url" == https://fiio-firmware.* ]] || return 1
+  mkdir -p "$cache_root"
+  temporary="$(mktemp "$cache_root/.latest-firmware.XXXXXX")"
+  temporary_url="$(mktemp "$cache_root/.latest-firmware-url.XXXXXX")"
+  printf '%s\n' "$latest" > "$temporary"
+  printf '%s\n' "$download_url" > "$temporary_url"
+  mv "$temporary" "$firmware_cache"
+  mv "$temporary_url" "$firmware_url_cache"
+  echo "$latest"
+}
+
+firmware_prepared_status() {
+  local version
+  [[ -f "$firmware_prepared" ]] || { echo no; return; }
+  read -r version < "$firmware_prepared"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo yes || echo no
+}
+
+firmware_prepared_version() {
+  [[ "$(firmware_prepared_status)" == yes ]] && head -n 1 "$firmware_prepared" || echo unknown
+}
+
+expected_firmware_image() {
+  local version="$1" major minor patch
+  IFS=. read -r major minor patch <<<"$version"
+  printf 'HIFIEC%s%s.IMG\n' "$major" "$minor"
+}
+
+validate_firmware_package() {
+  local archive="$1" version="$2" output="$3" expected entry count size
+  expected="$(expected_firmware_image "$version")"
+  unzip -tqq "$archive" >/dev/null 2>&1 || return 1
+  entry="$(unzip -Z1 "$archive" | grep -E "/${expected}$" | head -n 1)"
+  count="$(unzip -Z1 "$archive" | grep -Ec "/${expected}$" || true)"
+  [[ "$count" == 1 && -n "$entry" ]] || return 1
+  unzip -p "$archive" "$entry" > "$output" || return 1
+  size="$(file_size "$output")"
+  ((size >= 16777216 && size <= 67108864)) || return 1
+}
+
+prepare_firmware() {
+  local version download_url version_dir workdir archive image image_name
+  local zip_hash image_hash timestamp backup temporary
+  emit_progress 5 "Checking Echo Mini"
+  [[ "$mode" == data ]] || { echo "Echo Mini is not in USB Data mode"; return 1; }
+  [[ -n "$internal_device" && -n "$internal_mount" && -n "$sd_device" && -n "$sd_mount" ]] \
+    || { echo "Connect both Echo volumes before preparing firmware"; return 1; }
+  valid_echo_partition "$internal_device" MINI \
+    || { echo "Internal identity check failed"; return 1; }
+  valid_echo_partition "$sd_device" MINI_SD \
+    || { echo "SD identity check failed"; return 1; }
+  [[ "$(device_status)" == 8GB* ]] \
+    || { echo "Firmware preparation requires the detected 8GB model"; return 1; }
+  [[ "$(import_preview)" == "0 new · 0 conflicts · "* ]] \
+    || { echo "Import or resolve the Library before firmware preparation"; return 1; }
+
+  emit_progress 15 "Checking official release"
+  check_updates >/dev/null || { echo "Could not refresh official firmware metadata"; return 1; }
+  read -r version < "$firmware_cache"
+  read -r download_url < "$firmware_url_cache"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$download_url" == https://fiio-firmware.*"V${version}-8G.zip" ]] \
+    || { echo "Official 8GB firmware URL validation failed"; return 1; }
+
+  mkdir -p "$firmware_store"
+  version_dir="$firmware_store/$version"
+  mkdir -p "$version_dir"
+  workdir="$(mktemp -d "$firmware_store/.prepare-${version}.XXXXXX")"
+  archive="$workdir/firmware.zip"
+  image_name="$(expected_firmware_image "$version")"
+  image="$workdir/$image_name"
+  emit_progress 25 "Downloading firmware"
+  curl -LfsS --proto '=https' --tlsv1.2 --max-time 120 "$download_url" -o "$archive" \
+    || { echo "Firmware download failed"; return 1; }
+  emit_progress 50 "Validating package"
+  validate_firmware_package "$archive" "$version" "$image" \
+    || { echo "Firmware package validation failed"; return 1; }
+  zip_hash="$(sha256sum "$archive" | awk '{ print $1 }')"
+  image_hash="$(sha256sum "$image" | awk '{ print $1 }')"
+
+  emit_progress 65 "Backing up internal storage"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="$firmware_backup_root/${timestamp}-pre-${version}"
+  mkdir -p "$backup"
+  rsync -rt --exclude='*.IMG' --exclude='*.img' -- "$internal_mount/" "$backup/" \
+    || { echo "Internal memory backup failed"; return 1; }
+
+  emit_progress 90 "Saving verified package"
+  mv "$archive" "$version_dir/firmware.zip"
+  mv "$image" "$version_dir/$image_name"
+  printf '%s  firmware.zip\n' "$zip_hash" > "$version_dir/firmware.zip.sha256"
+  printf '%s  %s\n' "$image_hash" "$image_name" > "$version_dir/$image_name.sha256"
+  printf '%s\n' "$download_url" > "$version_dir/source-url"
+  printf '%s\n' "$backup" > "$version_dir/backup-path"
+  rm -r "$workdir"
+  mkdir -p "$config_root"
+  temporary="$(mktemp "$config_root/.firmware-prepared.XXXXXX")"
+  printf '%s\n' "$version" > "$temporary"
+  mv "$temporary" "$firmware_prepared"
+  emit_progress 100 "Package ready"
+  echo "$version package ready · safely eject, remove SD, reconnect Data"
+}
+
+install_prepared_firmware() {
+  local version version_dir image_name image expected_hash actual_hash target temporary_target
+  emit_progress 10 "Validating prepared firmware"
+  [[ "$mode" == data ]] || { echo "Echo Mini is not in USB Data mode"; return 1; }
+  [[ -n "$internal_device" && -n "$internal_mount" ]] \
+    || { echo "Echo internal memory is not mounted"; return 1; }
+  [[ -z "$sd_device" ]] || { echo "Remove the SD card before installing firmware"; return 1; }
+  valid_echo_partition "$internal_device" MINI \
+    || { echo "Internal identity check failed"; return 1; }
+  [[ "$(device_status)" == 8GB* ]] || { echo "Expected the 8GB Echo Mini"; return 1; }
+  [[ "$(firmware_prepared_status)" == yes ]] || { echo "No prepared firmware"; return 1; }
+  version="$(firmware_prepared_version)"
+  version_dir="$firmware_store/$version"
+  image_name="$(expected_firmware_image "$version")"
+  image="$version_dir/$image_name"
+  [[ -f "$image" && -f "$image.sha256" ]] || { echo "Prepared firmware files missing"; return 1; }
+  expected_hash="$(awk 'NR == 1 { print $1 }' "$image.sha256")"
+  actual_hash="$(sha256sum "$image" | awk '{ print $1 }')"
+  [[ "$actual_hash" == "$expected_hash" ]] || { echo "Prepared firmware checksum failed"; return 1; }
+  ! find "$internal_mount" -maxdepth 1 -type f -iname '*.img' -print -quit | grep -q . \
+    || { echo "An existing firmware image is already on the Echo"; return 1; }
+  (( $(df -PB1 "$internal_mount" | awk 'NR == 2 { print $4 }') > $(file_size "$image") + 1048576 )) \
+    || { echo "Not enough internal storage for firmware"; return 1; }
+
+  emit_progress 30 "Copying firmware to Echo"
+  target="$internal_mount/$image_name"
+  temporary_target="$internal_mount/.${image_name}.part"
+  cp "$image" "$temporary_target" || { echo "Firmware copy failed"; return 1; }
+  sync -f "$internal_mount" || { echo "Could not flush firmware writes"; return 1; }
+  emit_progress 65 "Verifying copied image"
+  [[ "$(sha256sum "$temporary_target" | awk '{ print $1 }')" == "$expected_hash" ]] \
+    || { echo "Firmware copy checksum failed"; return 1; }
+  mv "$temporary_target" "$target"
+  sync -f "$internal_mount" || { echo "Could not flush final firmware image"; return 1; }
+  [[ "$(sha256sum "$target" | awk '{ print $1 }')" == "$expected_hash" ]] \
+    || { echo "Final firmware checksum failed"; return 1; }
+  emit_progress 90 "Safely unmounting Echo"
+  mark_firmware_pending "$version" >/dev/null \
+    || { echo "Firmware copied, but pending state could not be recorded"; return 1; }
+  udisksctl unmount -b "$internal_device" >/dev/null 2>&1 \
+    || { echo "Firmware copied, but internal memory could not be safely unmounted"; return 1; }
+  rm -f "$firmware_prepared"
+  emit_progress 100 "Ready to restart"
+  echo "$version copied and verified · restart Echo · pending confirmation"
+}
+
+sync_preview() {
+  local source relative target source_time target_time difference
+  local new=0 updated=0 unchanged=0 skipped=0 unsupported=0
+  [[ -d "$inbox" ]] || { echo "Inbox missing"; return; }
+  [[ -n "$sd_mount" ]] || { echo "SD not mounted"; return; }
+
+  while IFS= read -r -d '' source; do
+    relative="${source#"$inbox"/}"
+    if [[ "${source,,}" == *.wv ]]; then
+      unsupported=$((unsupported + 1))
+      continue
+    fi
+    if [[ "$relative" != 0[1-9]_*/*/* ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    target="$sd_mount/$relative"
+    if [[ ! -f "$target" ]]; then
+      new=$((new + 1))
+    elif [[ "$(file_size "$source")" != "$(file_size "$target")" ]]; then
+      updated=$((updated + 1))
+    else
+      source_time="$(file_mtime "$source")"
+      target_time="$(file_mtime "$target")"
+      difference=$((source_time - target_time))
+      ((difference < 0)) && difference=$((-difference))
+      if ((difference > 1)); then
+        updated=$((updated + 1))
+      else
+        unchanged=$((unchanged + 1))
+      fi
+    fi
+  done < <(find "$inbox" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' \
+    -o -iname '*.wav' -o -iname '*.ape' -o -iname '*.ogg' -o -iname '*.dsf' \
+    -o -iname '*.wv' \) -print0 2>/dev/null)
+
+  echo "$new new · $updated updated · $unchanged unchanged · $skipped skipped · $unsupported unsupported"
+}
+
+import_preview() {
+  local source relative target source_time target_time difference
+  local new=0 conflicts=0 unchanged=0
+  [[ -n "$sd_mount" ]] || { echo "SD not mounted"; return; }
+
+  while IFS= read -r -d '' source; do
+    relative="${source#"$sd_mount"/}"
+    [[ "$relative" == 0[1-9]_*/*/* ]] || continue
+    target="$library/$relative"
+    if [[ ! -f "$target" ]]; then
+      new=$((new + 1))
+    elif [[ "$(file_size "$source")" != "$(file_size "$target")" ]]; then
+      conflicts=$((conflicts + 1))
+    else
+      source_time="$(file_mtime "$source")"
+      target_time="$(file_mtime "$target")"
+      difference=$((source_time - target_time))
+      ((difference < 0)) && difference=$((-difference))
+      if ((difference > 1)); then
+        conflicts=$((conflicts + 1))
+      else
+        unchanged=$((unchanged + 1))
+      fi
+    fi
+  done < <(find "$sd_mount" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' \
+    -o -iname '*.wav' -o -iname '*.ape' -o -iname '*.ogg' -o -iname '*.dsf' \) \
+    -print0 2>/dev/null)
+
+  echo "$new new · $conflicts conflicts · $unchanged unchanged"
+}
+
+import_required_bytes() {
+  local source relative total=0
+  while IFS= read -r -d '' source; do
+    relative="${source#"$sd_mount"/}"
+    [[ "$relative" == 0[1-9]_*/*/* ]] || continue
+    [[ -e "$library/$relative" ]] || total=$((total + $(file_size "$source")))
+  done < <(find "$sd_mount" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' \
+    -o -iname '*.wav' -o -iname '*.ape' -o -iname '*.ogg' -o -iname '*.dsf' \
+    -o -iname 'cover.jpg' -o -iname 'folder.jpg' \) -print0 2>/dev/null)
+  echo "$total"
+}
+
+copy_echo_to_library() {
+  local source relative list result
+  list="$(mktemp)"
+  mkdir -p "$library"
+
+  while IFS= read -r -d '' source; do
+    relative="${source#"$sd_mount"/}"
+    [[ "$relative" == 0[1-9]_*/*/* ]] || continue
+    [[ -e "$library/$relative" ]] && continue
+    printf '%s\0' "$relative" >> "$list"
+  done < <(find "$sd_mount" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' \
+    -o -iname '*.wav' -o -iname '*.ape' -o -iname '*.ogg' -o -iname '*.dsf' \
+    -o -iname 'cover.jpg' -o -iname 'folder.jpg' \) -print0 2>/dev/null)
+
+  rsync -rt --ignore-existing --modify-window=1 --from0 --files-from="$list" \
+    -- "$sd_mount/" "$library/"
+  result=$?
+  rm -f "$list"
+  return "$result"
+}
+
+import_from_echo() {
+  local required available preview reserve=536870912
+  emit_progress 10 "Checking Echo library"
+  [[ "$mode" == data ]] || { echo "Echo Mini is not in USB Data mode"; return 1; }
+  [[ -n "$sd_device" && -n "$sd_mount" ]] \
+    || { echo "Echo Mini SD is not mounted"; return 1; }
+  valid_echo_partition "$sd_device" MINI_SD \
+    || { echo "SD identity check failed"; return 1; }
+
+  emit_progress 25 "Checking local storage"
+  required="$(import_required_bytes)"
+  available="$(df -PB1 "$music_root" | awk 'NR == 2 { print $4 }')"
+  ((available >= required + reserve)) \
+    || { echo "Not enough local disk space"; return 1; }
+  emit_progress 40 "Copying new music"
+  copy_echo_to_library || { echo "Import copy failed"; return 1; }
+  sync -f "$library" || { echo "Could not flush Library writes"; return 1; }
+  emit_progress 85 "Verifying Library"
+  preview="$(import_preview)"
+  [[ "$preview" == "0 new · "* ]] \
+    || { echo "Import verification failed: $preview"; return 1; }
+  emit_progress 100 "Library updated"
+  echo "Import complete · $preview"
+}
+
+copy_inbox_to_sd() {
+  local source relative list result
+  list="$(mktemp)"
+
+  while IFS= read -r -d '' source; do
+    relative="${source#"$inbox"/}"
+    [[ "$relative" == 0[1-9]_*/*/* ]] || continue
+    printf '%s\0' "$relative" >> "$list"
+  done < <(find "$inbox" -type f \( -iname '*.flac' -o -iname '*.m4a' -o -iname '*.mp3' \
+    -o -iname '*.wav' -o -iname '*.ape' -o -iname '*.ogg' -o -iname '*.dsf' \
+    -o -iname 'cover.jpg' -o -iname 'folder.jpg' \) -print0 2>/dev/null)
+
+  rsync -rt --modify-window=1 --from0 --files-from="$list" -- "$inbox/" "$sd_mount/"
+  result=$?
+  rm -f "$list"
+  return "$result"
+}
+
+sync_to_echo() {
+  local preview
+  emit_progress 10 "Checking Inbox"
+  [[ "$mode" == data ]] || { echo "Echo Mini is not in USB Data mode"; return 1; }
+  [[ -n "$sd_device" && -n "$sd_mount" ]] \
+    || { echo "Echo Mini SD is not mounted"; return 1; }
+  valid_echo_partition "$sd_device" MINI_SD \
+    || { echo "SD identity check failed"; return 1; }
+  [[ -d "$inbox" ]] || { echo "Inbox missing"; return 1; }
+
+  emit_progress 35 "Copying music to SD"
+  copy_inbox_to_sd || { echo "Sync copy failed"; return 1; }
+  sync -f "$sd_mount" || { echo "Could not flush SD writes"; return 1; }
+  emit_progress 85 "Verifying SD card"
+  preview="$(sync_preview)"
+  [[ "$preview" == "0 new · 0 updated · "* ]] \
+    || { echo "Sync verification failed: $preview"; return 1; }
+  emit_progress 100 "Echo library updated"
+  echo "Sync complete · $preview"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  test_root="$(mktemp -d)"
+  trap 'rm -r "$test_root"' EXIT
+  inbox="$test_root/auto-inbox"
+  ensure_inbox
+  [[ -d "$inbox" ]]
+  mkdir -p "$test_root/01_This Week/Album One" "$test_root/02_Deep Night/Album Two"
+  touch "$test_root/01_This Week/Album One/one.flac"
+  touch "$test_root/02_Deep Night/Album Two/two.m4a"
+  touch "$test_root/00_README.txt" "$test_root/00_SNOWSKY_ACTIVE_BATCH.csv"
+  touch "$test_root/._artifact"
+  sd_mount="$test_root"
+  [[ "$(track_count)" == 2 ]]
+  [[ "$(file_count '*.flac')" == 1 ]]
+  [[ "$(file_count '*.m4a')" == 1 ]]
+  [[ "$(category_count)" == 2 ]]
+  [[ "$(album_count)" == 2 ]]
+  [[ "$(manifest_status)" == Ready ]]
+  [[ "$(cleanup_status)" == "1 AppleDouble files" ]]
+  [[ "$(emit_progress 42 Testing)" == $'PROGRESS\t42\tTesting' ]]
+  valid_properties=$'DEVTYPE=partition\nID_VENDOR_ID=071b\nID_MODEL_ID=3203\nID_MODEL=MINI\n'
+  valid_echo_properties "$valid_properties" MINI
+  ! valid_echo_properties "$valid_properties" MINI_SD
+  version_is_older 3.7.0 3.8.0
+  ! version_is_older 3.8.0 3.8.0
+  firmware_config="$test_root/firmware-version"
+  firmware_cache="$test_root/latest-firmware"
+  firmware_pending="$test_root/firmware-pending"
+  firmware_prepared="$test_root/firmware-prepared"
+  config_root="$test_root"
+  printf '3.7.0\n' > "$firmware_config"
+  printf '3.8.0\n' > "$firmware_cache"
+  [[ "$(firmware_status)" == "3.7.0 → 3.8.0 available" ]]
+  [[ "$(mark_firmware_pending 3.8.0)" == "3.8.0 pending confirmation" ]]
+  [[ "$(firmware_status)" == "3.7.0 → 3.8.0 pending confirmation" ]]
+  [[ "$(firmware_pending_status)" == yes ]]
+  [[ "$(confirm_firmware)" == "3.8.0 installed · confirmed" ]]
+  [[ "$(firmware_status)" == "3.8.0 · up to date" ]]
+  [[ "$(firmware_pending_status)" == no ]]
+  mkdir -p "$test_root/package/ECHO MINI V3.8.0-8G"
+  dd if=/dev/zero of="$test_root/package/ECHO MINI V3.8.0-8G/HIFIEC38.IMG" \
+    bs=1048576 count=16 status=none
+  (cd "$test_root/package" && zip -q "$test_root/firmware.zip" \
+    "ECHO MINI V3.8.0-8G/HIFIEC38.IMG")
+  validate_firmware_package "$test_root/firmware.zip" 3.8.0 "$test_root/validated.IMG"
+  [[ "$(file_size "$test_root/validated.IMG")" == 16777216 ]]
+  inbox="$test_root/inbox"
+  sd_mount="$test_root/sd"
+  mkdir -p "$inbox/01_This Week/New Album" "$inbox/02_Deep Night/Changed Album" \
+    "$inbox/03_Spark/Same Album" "$inbox/Loose" \
+    "$sd_mount/02_Deep Night/Changed Album" "$sd_mount/03_Spark/Same Album"
+  touch "$inbox/01_This Week/New Album/new.flac" "$inbox/Loose/skipped.mp3"
+  touch "$inbox/01_This Week/New Album/unsupported.wv"
+  touch "$inbox/01_This Week/New Album/cover.jpg"
+  printf x > "$inbox/02_Deep Night/Changed Album/changed.m4a"
+  touch "$sd_mount/02_Deep Night/Changed Album/changed.m4a"
+  printf x > "$inbox/03_Spark/Same Album/same.flac"
+  printf x > "$sd_mount/03_Spark/Same Album/same.flac"
+  touch -t 202001010000.00 "$inbox/03_Spark/Same Album/same.flac"
+  touch -t 202001010000.01 "$sd_mount/03_Spark/Same Album/same.flac"
+  [[ "$(sync_preview)" == "1 new · 1 updated · 1 unchanged · 1 skipped · 1 unsupported" ]]
+  copy_inbox_to_sd
+  [[ -f "$sd_mount/01_This Week/New Album/new.flac" ]]
+  [[ -f "$sd_mount/01_This Week/New Album/cover.jpg" ]]
+  [[ ! -e "$sd_mount/Loose/skipped.mp3" ]]
+  [[ ! -e "$sd_mount/01_This Week/New Album/unsupported.wv" ]]
+  library="$test_root/library"
+  mkdir -p "$library/01_This Week/New Album" "$library/02_Deep Night/Changed Album"
+  cp -p "$sd_mount/01_This Week/New Album/new.flac" \
+    "$library/01_This Week/New Album/new.flac"
+  printf conflict > "$library/02_Deep Night/Changed Album/changed.m4a"
+  [[ "$(import_preview)" == "1 new · 1 conflicts · 1 unchanged" ]]
+  copy_echo_to_library
+  [[ -f "$library/03_Spark/Same Album/same.flac" ]]
+  [[ -f "$library/01_This Week/New Album/cover.jpg" ]]
+  [[ "$(< "$library/02_Deep Night/Changed Album/changed.m4a")" == conflict ]]
+  [[ "$(import_preview)" == "0 new · 1 conflicts · 2 unchanged" ]]
+  exit
+fi
+
+ensure_inbox >/dev/null 2>&1 || true
+scan_devices
+
+if [[ "${1:-}" == "--open-inbox" ]]; then
+  open_inbox
+  exit
+fi
+
+if [[ "${1:-}" == "--check-updates" ]]; then
+  check_updates
+  exit
+fi
+
+if [[ "${1:-}" == "--mark-firmware-pending" ]]; then
+  mark_firmware_pending "${2:-}"
+  exit
+fi
+
+if [[ "${1:-}" == "--confirm-firmware" ]]; then
+  confirm_firmware
+  exit
+fi
+
+if [[ "${1:-}" == "--prepare-firmware" ]]; then
+  prepare_firmware
+  exit
+fi
+
+if [[ "${1:-}" == "--install-prepared-firmware" ]]; then
+  install_prepared_firmware
+  exit
+fi
+
+if [[ "${1:-}" == "--eject" ]]; then
+  safe_eject
+  exit
+fi
+
+if [[ "${1:-}" == "--sync-to-echo" ]]; then
+  sync_to_echo
+  exit
+fi
+
+if [[ "${1:-}" == "--import-from-echo" ]]; then
+  import_from_echo
+  exit
+fi
+
+if [[ "${1:-}" == "--details" ]]; then
+  printf 'mode\t%s\n' "$mode"
+  case "$mode" in
+    data)
+      mounted=no
+      [[ -n "$internal_mount" && -n "$sd_mount" ]] && mounted=yes
+      printf 'title\tUSB Data\nmounted\t%s\ninternal_mounted\t%s\nsd_present\t%s\nplugin\t%s\ndevice\t%s\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\t%s\ninternal_percent\t%s\nsd\t%s\nsd_percent\t%s\ntracks\t%s\nalbums\t%s\nformats\t%s FLAC · %s M4A\ncategories\t%s\nmanifests\t%s\ncleanup\t%s\nsync\t%s\nimport\t%s\n' \
+        "$mounted" \
+        "$([[ -n "$internal_mount" ]] && echo yes || echo no)" \
+        "$([[ -n "$sd_device" ]] && echo yes || echo no)" \
+        "$(plugin_version)" "$(device_status)" "$(firmware_status)" \
+        "$(firmware_installed_version)" \
+        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
+        "$(firmware_backup_status)" \
+        "$(firmware_pending_status)" "$(firmware_pending_version)" \
+        "$(firmware_prepared_status)" "$(firmware_prepared_version)" \
+        "$(usage "$internal_mount")" "$(usage_percent "$internal_mount")" \
+        "$(usage "$sd_mount")" "$(usage_percent "$sd_mount")" "$(track_count)" \
+        "$(album_count)" "$(file_count '*.flac')" "$(file_count '*.m4a')" \
+        "$(category_count)" "$(manifest_status)" "$(cleanup_status)" \
+        "$(sync_preview)" "$(import_preview)"
+      ;;
+    dac)
+      printf 'title\tUSB DAC · 48 kHz\nmounted\tno\ninternal_mounted\tno\nsd_present\tno\nplugin\t%s\ndevice\tUSB DAC\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\tUnavailable in DAC mode\ninternal_percent\t0\nsd\tUnavailable in DAC mode\nsd_percent\t0\ntracks\t—\nalbums\t—\nformats\t—\ncategories\t—\nmanifests\t—\ncleanup\t—\nsync\t—\nimport\t—\n' \
+        "$(plugin_version)" "$(firmware_status)" \
+        "$(firmware_installed_version)" \
+        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
+        "$(firmware_backup_status)" \
+        "$(firmware_pending_status)" "$(firmware_pending_version)" \
+        "$(firmware_prepared_status)" "$(firmware_prepared_version)"
+      ;;
+    *)
+      printf 'title\tDisconnected\nmounted\tno\ninternal_mounted\tno\nsd_present\tno\nplugin\t%s\ndevice\t—\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\t—\ninternal_percent\t0\nsd\t—\nsd_percent\t0\ntracks\t—\nalbums\t—\nformats\t—\ncategories\t—\nmanifests\t—\ncleanup\t—\nsync\t—\nimport\t—\n' \
+        "$(plugin_version)" "$(firmware_status)" \
+        "$(firmware_installed_version)" \
+        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
+        "$(firmware_backup_status)" \
+        "$(firmware_pending_status)" "$(firmware_pending_version)" \
+        "$(firmware_prepared_status)" "$(firmware_prepared_version)"
+      ;;
+  esac
+  exit
+fi
+
+echo "$mode"
+case "$mode" in
+  data) exit 10 ;;
+  dac) exit 20 ;;
+  *) exit 1 ;;
+esac

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.subirats345.echo-shelf",
+  "name": "Echo Shelf",
+  "version": "1.0.0",
+  "author": "Joan Subirats",
+  "description": "A focused Overview, Library, and Firmware panel for the Snowsky Echo Mini.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Echo Shelf",
+    "description": "Shows Echo Mini shelf health and safely unmounts its two USB volumes.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
