@@ -214,6 +214,14 @@ Panel {
     onExited: function(exitCode) {
       var nextMode = exitCode === 10 ? "data" : exitCode === 20 ? "dac" : "disconnected"
       var modeChanged = root.mode !== nextMode
+      if (modeChanged) {
+        root.cancelArms()
+        root.actionKind = ""
+        root.actionLabel = ""
+        root.actionOutput = ""
+        root.actionStatus = ""
+        root.actionProgress = 0
+      }
       if (nextMode === "disconnected") root.close()
       root.mode = nextMode
       if (modeChanged && nextMode !== "disconnected") {
