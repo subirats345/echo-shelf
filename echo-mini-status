@@ -666,13 +666,23 @@ emit_details() {
 }
 
 refresh_details_cache() {
-  local temporary
+  local started_at
   [[ "$mode" != disconnected ]] || { emit_details; return; }
   mkdir -p "$cache_root" || { emit_details; return; }
-  temporary="$(mktemp "$cache_root/.details.XXXXXX")" || { emit_details; return; }
-  emit_details > "$temporary"
-  cat "$temporary"
-  mv "$temporary" "$details_cache"
+  started_at="$(date +%s)"
+  (
+    local cache_mtime temporary
+    flock 9 || { emit_details; return; }
+    cache_mtime="$([[ -f "$details_cache" ]] && stat -c %Y "$details_cache" || echo 0)"
+    if ((cache_mtime >= started_at)); then
+      read_cached_details
+      return
+    fi
+    temporary="$(mktemp "$cache_root/.details.XXXXXX")" || { emit_details; return; }
+    emit_details > "$temporary"
+    cat "$temporary"
+    mv "$temporary" "$details_cache"
+  ) 9> "$cache_root/details.lock"
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
