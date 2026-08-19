@@ -15,6 +15,15 @@ Panel {
 
   property string mode: "disconnected"
   property var details: ({})
+  property var statusCandidate: ({})
+  property var detailsCandidate: ({})
+  property string connectionFingerprint: "disconnected"
+  property string connectionToken: "disconnected"
+  property string mountToken: "disconnected"
+  property bool detailsRefreshFailed: false
+  property int mountRetryCount: 0
+  property int refreshRetryCount: 0
+  property bool updateCheckFailed: false
   property string activeTab: "overview"
   property bool ejectArmed: false
   property bool syncArmed: false
@@ -26,27 +35,62 @@ Panel {
   property string actionOutput: ""
   property string actionStatus: ""
   property int actionProgress: 0
+  property bool actionSucceeded: false
+
+  onActiveTabChanged: cancelArms()
+
+  onActionStatusChanged: {
+    if (actionStatus !== "" && panel.open)
+      panel.Accessible.announce(actionStatus, Accessible.Polite)
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color barIconColor: mode === "disconnected" ? dim : foreground
+  readonly property color barIconColor: mode === "error" ? urgent : mode === "disconnected" ? dim : foreground
   readonly property string helperPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/" + moduleName + "/echo-mini-status"
   readonly property bool actionRunning: ejectProbe.running || syncProbe.running
     || importProbe.running || firmwarePrepareProbe.running || firmwareInstallProbe.running
     || firmwareConfirmProbe.running
-  readonly property bool firmwareCurrent: details.firmware_installed !== undefined
-    && details.firmware_installed !== "unknown"
-    && details.firmware_installed === details.firmware_latest
-  readonly property bool firmwareAvailable: String(details.firmware || "").indexOf("Installed unknown") === 0
-    || String(details.firmware || "").indexOf(" available") > 0
+  readonly property bool internalPresent: details.internal_present === "yes"
+  readonly property bool internalMounted: details.internal_mounted === "yes"
+  readonly property bool sdPresent: details.sd_present === "yes"
+  readonly property bool sdMounted: details.sd_mounted === "yes"
+  readonly property bool stateAligned: details.mount_token === mountToken
+  readonly property bool deviceReady: !details.device_error && stateAligned && !detailsRefreshFailed
+  readonly property bool firmwareCurrent: details.firmware_state === "current"
+  readonly property bool firmwareAvailable: details.firmware_state === "available"
+    || (details.firmware_state === "unknown" && details.firmware_latest
+      && details.firmware_latest !== "unknown")
+  readonly property bool firmwareActionAvailable: details.firmware_pending === "yes"
+    || details.firmware_prepared === "yes" || (mode === "data" && firmwareAvailable)
+  readonly property int syncNew: parseInt(details.sync_new || "0", 10)
+  readonly property int syncUpdated: parseInt(details.sync_updated || "0", 10)
+  readonly property int syncSkipped: parseInt(details.sync_skipped || "0", 10)
+  readonly property int syncUnsupported: parseInt(details.sync_unsupported || "0", 10)
+  readonly property int importNew: parseInt(details.import_new || "0", 10)
+  readonly property int importConflicts: parseInt(details.import_conflicts || "0", 10)
+  readonly property int importSkipped: parseInt(details.import_skipped || "0", 10)
+  readonly property int importUnsupported: parseInt(details.import_unsupported || "0", 10)
+  readonly property bool syncCurrent: details.sync_state === "ok" && syncNew === 0 && syncUpdated === 0
+  readonly property bool importCurrent: details.import_state === "ok" && importNew === 0 && importConflicts === 0
 
   function connectionMeta() {
-    if (mode === "dac") return "USB DAC · 48 KHZ"
-    if (details.mounted === "yes") return "USB DATA · READY"
-    if (details.internal_mounted === "yes") return "USB DATA · INTERNAL ONLY"
+    if (mode === "error") return "PLUGIN ERROR"
+    if (detailsProbe.running) return mode === "dac" ? "USB DAC · UPDATING" : "USB DATA · UPDATING"
+    if (detailsRefreshFailed) return mode === "dac"
+      ? (refreshRetryCount < 3 ? "USB DAC · RETRYING" : "USB DAC · REFRESH FAILED")
+      : (refreshRetryCount < 3 ? "USB DATA · RETRYING" : "USB DATA · REFRESH FAILED")
+    if (mode === "dac") return "USB DAC"
+    if (details.device_error) return "USB DATA · CHECK DEVICES"
+    if (internalMounted && sdMounted) return "USB DATA · READY"
+    if (mountRetryCount > 0 && ((internalPresent && !internalMounted) || (sdPresent && !sdMounted)))
+      return "USB DATA · CONNECTING"
+    if (internalMounted && sdPresent && !sdMounted) return "USB DATA · SD NOT MOUNTED"
+    if (internalMounted) return "USB DATA · INTERNAL ONLY"
+    if (sdMounted) return "USB DATA · SD ONLY"
     return "USB DATA · SAFE TO DISCONNECT"
   }
 
@@ -56,35 +100,49 @@ Panel {
   }
 
   function syncSummary() {
-    var value = String(details.sync || "")
-    if (value.indexOf("0 new · 0 updated") === 0) return ""
-    if (value === "SD not mounted") return "Connect the SD card"
-    return value || "Checking Inbox…"
+    if (details.sync_state === "sd_missing") return "Connect or mount the SD card"
+    if (details.sync_state === "inbox_missing") return "Inbox unavailable"
+    if (details.sync_state !== "ok") return "Checking Inbox…"
+    var work = []
+    if (syncNew > 0) work.push(syncNew + " new")
+    if (syncUpdated > 0) work.push(syncUpdated + " updated")
+    if (syncSkipped > 0) work.push(syncSkipped + " skipped")
+    if (syncUnsupported > 0) work.push(syncUnsupported + " unsupported audio")
+    return work.join(" · ")
   }
 
   function importSummary() {
-    var value = String(details["import"] || "")
-    if (value.indexOf("0 new · 0 conflicts") === 0) return ""
-    if (value === "SD not mounted") return "Connect the SD card"
-    return value || "Checking Library…"
+    if (details.import_state === "sd_missing") return "Connect or mount the SD card"
+    if (details.import_state !== "ok") return "Checking Library…"
+    var work = []
+    if (importNew > 0) work.push(importNew + " new")
+    if (importConflicts > 0) work.push(importConflicts + " conflict" + (importConflicts === 1 ? " · local kept" : "s · local kept"))
+    if (importSkipped > 0) work.push(importSkipped + " skipped")
+    if (importUnsupported > 0) work.push(importUnsupported + " unsupported audio")
+    return work.join(" · ")
   }
 
   function firmwareSummary() {
+    if (updateProbe.running) return "Checking for updates…"
     if (details.firmware_installed === "unknown") return "Check the version on the Echo"
-    if (firmwareCurrent) return "Up to date"
+    if (firmwareCurrent) {
+      if (updateCheckFailed) return "Up to date · using cached update data"
+      return details.firmware_feed === "stale" ? "Up to date · update check stale" : "Up to date"
+    }
     if (details.firmware_pending === "yes") return "Restarted? Confirm the version on the Echo"
     if (details.firmware_prepared === "yes") return details.sd_present === "yes"
       ? "Safely eject, remove SD, then reconnect" : "Ready to install"
     if (firmwareAvailable) return (details.firmware_latest || "Update") + " available"
+      + (updateCheckFailed ? " · cached" : "")
     return "Checking for updates…"
   }
 
   function cancelArms() {
-    ejectArmed = false; ejectTimer.stop()
-    syncArmed = false; syncTimer.stop()
-    importArmed = false; importTimer.stop()
-    firmwarePrepareArmed = false; firmwarePrepareTimer.stop()
-    firmwareInstallArmed = false; firmwareInstallTimer.stop()
+    ejectArmed = false
+    syncArmed = false
+    importArmed = false
+    firmwarePrepareArmed = false
+    firmwareInstallArmed = false
   }
 
   function startAction(kind, label, progress) {
@@ -94,6 +152,18 @@ Panel {
     actionOutput = ""
     actionStatus = ""
     actionProgress = progress
+    actionSucceeded = false
+    actionClearTimer.stop()
+  }
+
+  function clearAction() {
+    actionKind = ""
+    actionLabel = ""
+    actionOutput = ""
+    actionStatus = ""
+    actionProgress = 0
+    actionSucceeded = false
+    actionClearTimer.stop()
   }
 
   function handleActionLine(line) {
@@ -109,8 +179,11 @@ Panel {
   }
 
   function finishAction(exitCode, success, failure) {
-    if (exitCode === 0) actionProgress = 100
+    if (exitCode === 0 || exitCode === 2) actionProgress = 100
+    actionSucceeded = exitCode === 0
     actionStatus = actionOutput || (exitCode === 0 ? success : failure)
+    if (actionSucceeded) actionClearTimer.restart()
+    refreshStatus()
     refreshDetails()
   }
 
@@ -119,24 +192,26 @@ Panel {
   }
 
   function refreshDetails() {
-    if (opened && !actionRunning && !detailsProbe.running) detailsProbe.running = true
+    if ((mode === "data" || mode === "dac") && !actionRunning && !detailsProbe.running)
+      detailsProbe.running = true
   }
 
   function requestEject() {
-    if (mode !== "data" || details.internal_mounted !== "yes" || actionRunning) return
+    if (mode !== "data" || !deviceReady || (!internalMounted && !sdMounted) || actionRunning) return
     if (!ejectArmed) {
-      cancelArms(); ejectArmed = true; ejectTimer.restart(); return
+      cancelArms(); ejectArmed = true; return
     }
-    startAction("overview", "Safely unmounting Echo", 25)
+    mountRetryCount = 0
+    startAction("overview", "Safely unmounting Echo", 1)
     ejectProbe.running = true
   }
 
   function requestSync() {
-    if (mode !== "data" || details.mounted !== "yes" || actionRunning) return
+    if (mode !== "data" || !deviceReady || !sdMounted || actionRunning || syncCurrent) return
     if (!syncArmed) {
-      cancelArms(); syncArmed = true; syncTimer.restart(); return
+      cancelArms(); syncArmed = true; return
     }
-    startAction("library", "Checking Inbox", 5)
+    startAction("library", "Checking Inbox", 1)
     syncProbe.running = true
   }
 
@@ -145,36 +220,39 @@ Panel {
   }
 
   function requestImport() {
-    if (mode !== "data" || details.mounted !== "yes" || actionRunning) return
-    if (!importArmed) {
-      cancelArms(); importArmed = true; importTimer.restart(); return
+    if (mode !== "data" || !deviceReady || !sdMounted || actionRunning || importCurrent) return
+    if (importNew === 0 && importConflicts > 0) {
+      if (!openLibraryProbe.running) openLibraryProbe.running = true
+      return
     }
-    startAction("library", "Checking Echo library", 5)
+    if (!importArmed) {
+      cancelArms(); importArmed = true; return
+    }
+    startAction("library", "Checking Echo library", 1)
     importProbe.running = true
   }
 
   function requestFirmwarePrepare() {
-    if (mode !== "data" || details.mounted !== "yes" || actionRunning) return
+    if (mode !== "data" || !deviceReady || !internalMounted || !sdMounted || actionRunning) return
     if (!firmwarePrepareArmed) {
-      cancelArms(); firmwarePrepareArmed = true; firmwarePrepareTimer.restart(); return
+      cancelArms(); firmwarePrepareArmed = true; return
     }
-    startAction("firmware", "Checking Echo Mini", 5)
+    startAction("firmware", "Checking Echo Mini", 1)
     firmwarePrepareProbe.running = true
   }
 
   function requestFirmwareInstall() {
-    if (mode !== "data" || details.internal_mounted !== "yes"
-        || details.sd_present !== "no" || actionRunning) return
+    if (mode !== "data" || !deviceReady || !internalMounted || sdPresent || actionRunning) return
     if (!firmwareInstallArmed) {
-      cancelArms(); firmwareInstallArmed = true; firmwareInstallTimer.restart(); return
+      cancelArms(); firmwareInstallArmed = true; return
     }
-    startAction("firmware", "Validating prepared firmware", 5)
+    startAction("firmware", "Validating prepared firmware", 1)
     firmwareInstallProbe.running = true
   }
 
   function requestFirmwareConfirm() {
-    if (actionRunning) return
-    startAction("firmware", "Recording installed version", 30)
+    if (!deviceReady || actionRunning) return
+    startAction("firmware", "Recording installed version", 1)
     firmwareConfirmProbe.running = true
   }
 
@@ -183,6 +261,35 @@ Panel {
     var index = tabs.indexOf(activeTab)
     activeTab = tabs[(index + step + tabs.length) % tabs.length]
     panelFlick.contentY = 0
+  }
+
+  function tabActions() {
+    if (activeTab === "overview") return [ejectRow]
+    if (activeTab === "library") return [inboxRow, syncRow, importRow]
+    return [firmwareConfirmButton, firmwarePrepareButton, firmwareInstallButton]
+  }
+
+  function focusFirstAction(direction) {
+    var actions = tabActions()
+    if (direction < 0) actions.reverse()
+    for (var i = 0; i < actions.length; i++) {
+      var target = actions[i]
+      if (target && target.visible && target.enabled) {
+        if (target.focusAction) target.focusAction()
+        else target.forceActiveFocus()
+        return
+      }
+    }
+  }
+
+  function actionFocusActive() {
+    var actions = [ejectRow, inboxRow, syncRow, importRow,
+      firmwareConfirmButton, firmwarePrepareButton, firmwareInstallButton]
+    for (var i = 0; i < actions.length; i++) {
+      var target = actions[i]
+      if (target && (target.actionHasFocus || target.activeFocus)) return true
+    }
+    return false
   }
 
   IpcHandler {
@@ -200,6 +307,7 @@ Panel {
       refreshDetails()
     } else {
       cancelArms()
+      clearAction()
     }
   }
 
@@ -210,11 +318,43 @@ Panel {
   Process {
     id: statusProbe
     command: [root.helperPath]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.statusCandidate = Model.parseKeyValue(text)
+    }
     onExited: function(exitCode) {
-      var nextMode = exitCode === 10 ? "data" : exitCode === 20 ? "dac" : "disconnected"
+      var observed = root.statusCandidate || ({})
+      var nextMode = observed.mode || (exitCode === 10 ? "data" : exitCode === 20 ? "dac"
+        : exitCode === 1 ? "disconnected" : "error")
+      var nextFingerprint = observed.fingerprint || nextMode
+      var nextToken = observed.connection_token || nextFingerprint
+      var nextMountToken = observed.mount_token || nextMode
+      var modeChanged = root.mode !== nextMode
+      var connectionChanged = root.connectionToken !== nextToken
+      var mountChanged = root.mountToken !== nextMountToken
+      if (modeChanged || connectionChanged) {
+        root.cancelArms()
+        root.clearAction()
+        root.detailsRefreshFailed = false
+        root.mountRetryCount = nextMode === "data" ? 5 : 0
+        root.refreshRetryCount = 0
+      }
       if (nextMode === "disconnected") root.close()
       root.mode = nextMode
-      if (root.opened) root.refreshDetails()
+      root.connectionFingerprint = nextFingerprint
+      root.connectionToken = nextToken
+      root.mountToken = nextMountToken
+      root.statusCandidate = ({})
+      if (nextMode === "error") {
+        mountRetryTimer.stop()
+        if (detailsProbe.running) detailsProbe.running = false
+        root.details = ({ device_error: observed.device_error || "Echo Shelf helper failed" })
+      } else if ((modeChanged || connectionChanged) && nextMode !== "disconnected") {
+        if (!cachedDetailsProbe.running) cachedDetailsProbe.running = true
+        root.refreshDetails()
+      } else if (mountChanged && nextMode !== "disconnected") {
+        root.refreshDetails()
+      }
     }
   }
 
@@ -242,7 +382,10 @@ Panel {
   Process {
     id: updateProbe
     command: [root.helperPath, "--check-updates"]
-    onExited: root.refreshDetails()
+    onExited: function(exitCode) {
+      root.updateCheckFailed = exitCode !== 0
+      root.refreshDetails()
+    }
   }
 
   Process {
@@ -266,6 +409,12 @@ Panel {
   }
 
   Process {
+    id: openLibraryProbe
+    command: [root.helperPath, "--open-library"]
+    onExited: root.refreshDetails()
+  }
+
+  Process {
     id: ejectProbe
     command: [root.helperPath, "--eject"]
     stdout: SplitParser { onRead: function(line) { root.handleActionLine(line) } }
@@ -273,11 +422,52 @@ Panel {
   }
 
   Process {
-    id: detailsProbe
-    command: [root.helperPath, "--details"]
+    id: cachedDetailsProbe
+    command: [root.helperPath, "--cached-details"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.details = Model.parseKeyValue(text)
+      onStreamFinished: {
+        var cached = Model.parseKeyValue(text)
+        if (cached.mode === root.mode && cached.fingerprint === root.connectionFingerprint)
+          root.details = cached
+      }
+    }
+  }
+
+  Process {
+    id: detailsProbe
+    command: ["timeout", "20", root.helperPath, "--details"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.detailsCandidate = Model.parseKeyValue(text)
+    }
+    onExited: function(exitCode) {
+      var candidate = root.detailsCandidate || ({})
+      var accepted = exitCode === 0 && candidate.mode === root.mode
+        && candidate.fingerprint === root.connectionFingerprint
+        && candidate.mount_token === root.mountToken
+        && candidate.refresh_state === "fresh"
+      if (accepted) {
+        root.details = candidate
+        root.detailsRefreshFailed = false
+        root.refreshRetryCount = 0
+        var waitingForMount = root.mode === "data" && root.mountRetryCount > 0
+          && ((candidate.internal_present === "yes" && candidate.internal_mounted !== "yes")
+            || (candidate.sd_present === "yes" && candidate.sd_mounted !== "yes"))
+        if (waitingForMount) {
+          root.mountRetryCount--
+          mountRetryTimer.restart()
+        } else {
+          root.mountRetryCount = 0
+        }
+      } else if (root.mode === "data" || root.mode === "dac") {
+        root.detailsRefreshFailed = true
+        if (root.refreshRetryCount < 3) {
+          root.refreshRetryCount++
+          mountRetryTimer.restart()
+        }
+      }
+      root.detailsCandidate = ({})
     }
   }
 
@@ -297,14 +487,16 @@ Panel {
     onTriggered: root.refreshStatus()
   }
 
-  Timer { id: importTimer; interval: 5000; onTriggered: root.importArmed = false }
-  Timer { id: syncTimer; interval: 5000; onTriggered: root.syncArmed = false }
-  Timer { id: ejectTimer; interval: 5000; onTriggered: root.ejectArmed = false }
-  Timer { id: firmwarePrepareTimer; interval: 5000; onTriggered: root.firmwarePrepareArmed = false }
-  Timer { id: firmwareInstallTimer; interval: 5000; onTriggered: root.firmwareInstallArmed = false }
+  Timer { id: actionClearTimer; interval: 8000; onTriggered: root.clearAction() }
 
   Timer {
-    interval: 5000
+    id: mountRetryTimer
+    interval: 2000
+    onTriggered: root.refreshDetails()
+  }
+
+  Timer {
+    interval: 30000
     running: root.opened
     repeat: true
     onTriggered: root.refreshDetails()
@@ -323,7 +515,8 @@ Panel {
         }
       }
     }
-    tooltipText: root.mode === "dac" ? "Echo Mini · USB DAC · 48 kHz" : "Echo Mini · USB Data"
+    tooltipText: root.mode === "error" ? "Echo Shelf needs attention"
+      : root.mode === "dac" ? "Echo Mini · USB DAC" : "Echo Mini · USB Data"
     onPressed: root.toggle()
   }
 
@@ -340,9 +533,12 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      Accessible.name: "Echo Mini"
+      Accessible.role: Accessible.Pane
+      blocked: root.actionFocusActive()
       onMoveRequested: function(dx, dy) { if (dx !== 0) root.switchTab(dx) }
       onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTabRequested: function(direction) { root.focusFirstAction(direction) }
       onTextKey: function(text) {
         var key = String(text).toLowerCase()
         if (key === "1" || key === "o") root.activeTab = "overview"
@@ -370,7 +566,7 @@ Panel {
             width: parent.width
             title: "Echo Mini"
             meta: root.connectionMeta()
-            detail: ""
+            detail: root.details.device_error || ""
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconOpacity: root.mode === "disconnected" ? 0.5 : 1.0
@@ -408,7 +604,7 @@ Panel {
             spacing: Style.space(12)
 
             PanelSectionHeader {
-              text: root.mode === "dac" ? "CONNECTION" : "STORAGE"
+              text: root.mode === "data" ? "STORAGE" : "CONNECTION"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -418,7 +614,15 @@ Panel {
               width: parent.width
               label: "Connection"
               value: "USB DAC"
-              caption: "Audio at 48 kHz"
+              caption: "Audio mode"
+            }
+
+            ValueRow {
+              visible: root.mode === "error"
+              width: parent.width
+              label: "Status"
+              value: "Unavailable"
+              caption: root.details.device_error || "Restart the shell or reinstall Echo Shelf"
             }
 
             Column {
@@ -431,7 +635,8 @@ Panel {
                 label: "Internal"
                 meta: root.storageUsage(root.details.internal)
                 percent: parseInt(root.details.internal_percent || "0", 10)
-                available: root.details.internal_mounted === "yes"
+                available: root.internalMounted
+                loading: detailsProbe.running && root.details.internal === undefined
               }
 
               StorageMeter {
@@ -439,20 +644,22 @@ Panel {
                 label: "SD card"
                 meta: root.storageUsage(root.details.sd)
                 percent: parseInt(root.details.sd_percent || "0", 10)
-                available: root.details.mounted === "yes"
+                available: root.sdMounted
+                loading: detailsProbe.running && root.details.sd === undefined
               }
             }
 
             PanelSeparator { visible: root.mode === "data"; width: parent.width; foreground: root.foreground }
 
             ActionRow {
+              id: ejectRow
               width: parent.width
               visible: root.mode === "data"
               label: "Disconnect safely"
-              caption: root.details.internal_mounted === "yes"
+              caption: root.internalMounted || root.sdMounted
                 ? "Before unplugging" : "Safe to unplug"
-              buttonText: root.ejectArmed ? "Press again" : "Eject"
-              enabled: root.details.internal_mounted === "yes" && !root.actionRunning
+              buttonText: root.ejectArmed ? "Confirm eject" : "Eject"
+              enabled: root.deviceReady && (root.internalMounted || root.sdMounted) && !root.actionRunning
               active: root.ejectArmed
               onTriggered: root.requestEject()
             }
@@ -478,6 +685,7 @@ Panel {
             PanelSectionHeader { text: "TRANSFER"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             ActionRow {
+              id: inboxRow
               width: parent.width
               label: "Inbox"
               caption: "Add music here"
@@ -487,27 +695,30 @@ Panel {
             }
 
             ActionRow {
+              id: syncRow
               width: parent.width
               label: "Send to Echo"
               caption: root.syncSummary()
-              statusText: String(root.details.sync || "").indexOf("0 new · 0 updated") === 0 ? "SYNCED" : ""
-              buttonText: root.syncArmed ? "Press again" : "Send"
-              enabled: root.mode === "data" && root.details.mounted === "yes"
+              statusText: root.syncCurrent ? "SYNCED" : ""
+              buttonText: root.syncArmed ? "Confirm send" : "Send"
+              enabled: root.mode === "data" && root.deviceReady && root.sdMounted
                 && !root.actionRunning
-                && String(root.details.sync || "").indexOf("0 new · 0 updated") !== 0
+                && !root.syncCurrent
               active: root.syncArmed
               onTriggered: root.requestSync()
             }
 
             ActionRow {
+              id: importRow
               width: parent.width
               label: "Import from Echo"
               caption: root.importSummary()
-              statusText: String(root.details["import"] || "").indexOf("0 new") === 0 ? "UP TO DATE" : ""
-              buttonText: root.importArmed ? "Press again" : "Import"
-              enabled: root.mode === "data" && root.details.mounted === "yes"
+              statusText: root.importCurrent ? "UP TO DATE" : ""
+              buttonText: root.importNew === 0 && root.importConflicts > 0 ? "Open library"
+                : root.importArmed ? "Confirm import" : "Import"
+              enabled: root.mode === "data" && root.deviceReady && root.sdMounted
                 && !root.actionRunning
-                && String(root.details["import"] || "").indexOf("0 new") !== 0
+                && !root.importCurrent
               active: root.importArmed
               onTriggered: root.requestImport()
             }
@@ -530,56 +741,92 @@ Panel {
             }
 
             PanelSeparator {
-              visible: !root.firmwareCurrent
+              visible: root.firmwareActionAvailable
               width: parent.width
               foreground: root.foreground
             }
             PanelSectionHeader {
-              visible: !root.firmwareCurrent
+              visible: root.firmwareActionAvailable
               text: "NEXT STEP"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
             Button {
+              id: firmwareConfirmButton
               width: parent.width
               visible: root.details.firmware_pending === "yes"
-              enabled: !root.actionRunning
-              text: "Confirm " + (root.details.firmware_pending_version || "firmware")
+              enabled: root.deviceReady && !root.actionRunning
+              text: "I verified " + (root.details.firmware_pending_version || "firmware") + " on the Echo"
               fontSize: Style.font.bodySmall
               foreground: root.foreground
               fontFamily: root.fontFamily
               bordered: true
+              focusable: true
+              Accessible.name: text
+              Accessible.description: "Records the version shown on the Echo Mini"
+              Accessible.role: Accessible.Button
+              Accessible.onPressAction: root.requestFirmwareConfirm()
+              Keys.onEscapePressed: root.close()
               onClicked: root.requestFirmwareConfirm()
             }
 
             Button {
+              id: firmwarePrepareButton
               width: parent.width
               visible: root.mode === "data" && root.firmwareAvailable
                 && root.details.firmware_pending !== "yes" && root.details.firmware_prepared !== "yes"
-              enabled: root.details.mounted === "yes" && !root.actionRunning
-                && String(root.details["import"] || "").indexOf("0 new · 0 conflicts") === 0
-              text: root.firmwarePrepareArmed ? "Press again to prepare" : "Prepare " + root.details.firmware_latest
+              enabled: root.deviceReady && root.internalMounted && root.sdMounted && !root.actionRunning
+                && root.importCurrent
+              text: root.firmwarePrepareArmed ? "Confirm preparation" : "Prepare " + root.details.firmware_latest
               fontSize: Style.font.bodySmall
               foreground: root.foreground
               fontFamily: root.fontFamily
               bordered: true
+              focusable: true
+              Accessible.name: text
+              Accessible.description: "Downloads, validates, and backs up before preparing firmware"
+              Accessible.role: Accessible.Button
+              Accessible.onPressAction: root.requestFirmwarePrepare()
+              Keys.onEscapePressed: root.close()
               active: root.firmwarePrepareArmed
               onClicked: root.requestFirmwarePrepare()
             }
 
+            Text {
+              visible: firmwarePrepareButton.visible && !firmwarePrepareButton.enabled
+              width: parent.width
+              text: !root.deviceReady ? "Wait for the Echo status to refresh"
+                : !root.internalMounted || !root.sdMounted ? "Mount both Echo volumes first"
+                : !root.importCurrent ? "Import new files or review conflicts first"
+                : "Another operation is running"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              Accessible.name: text
+              Accessible.role: Accessible.StaticText
+            }
+
             Button {
+              id: firmwareInstallButton
               width: parent.width
               visible: root.details.firmware_prepared === "yes"
-              enabled: root.mode === "data" && root.details.internal_mounted === "yes"
-                && root.details.sd_present === "no" && !root.actionRunning
-              text: root.details.sd_present === "yes" ? "Safely eject, remove SD, reconnect"
-                : root.details.internal_mounted !== "yes" ? "Reconnect in USB Data"
-                : root.firmwareInstallArmed ? "Press again to install"
+              enabled: root.mode === "data" && root.deviceReady && root.internalMounted
+                && !root.sdPresent && !root.actionRunning
+              text: root.sdPresent ? "Safely eject, remove SD, reconnect"
+                : !root.internalMounted ? "Reconnect in USB Data"
+                : root.firmwareInstallArmed ? "Confirm installation"
                 : "Install " + root.details.firmware_prepared_version
               foreground: root.foreground
               fontFamily: root.fontFamily
               bordered: true
+              focusable: true
+              Accessible.name: text
+              Accessible.description: "Copies and verifies the prepared firmware image"
+              Accessible.role: Accessible.Button
+              Accessible.onPressAction: root.requestFirmwareInstall()
+              Keys.onEscapePressed: root.close()
               active: root.firmwareInstallArmed
               onClicked: root.requestFirmwareInstall()
             }
@@ -689,6 +936,9 @@ Panel {
     property string meta: "—"
     property int percent: 0
     property bool available: false
+    property bool loading: false
+    Accessible.name: label + ", " + (loading ? "reading" : available ? percent + " percent, " + meta : "not mounted")
+    Accessible.role: Accessible.StaticText
     implicitHeight: storageLayout.implicitHeight
     height: implicitHeight
     RowLayout {
@@ -722,7 +972,7 @@ Panel {
       }
       Text {
         Layout.preferredWidth: Style.space(40)
-        text: storageMeter.available ? storageMeter.percent + "%" : "—"
+        text: storageMeter.loading ? "…" : storageMeter.available ? storageMeter.percent + "%" : "—"
         color: root.foreground
         opacity: storageMeter.available ? 1.0 : 0.6
         font.family: root.fontFamily
@@ -731,7 +981,7 @@ Panel {
       }
       Text {
         Layout.preferredWidth: Style.space(62)
-        text: storageMeter.available ? storageMeter.meta : "Not mounted"
+        text: storageMeter.loading ? "Reading…" : storageMeter.available ? storageMeter.meta : "Not mounted"
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -746,6 +996,8 @@ Panel {
     property string label: ""
     property string meta: ""
     property int value: 0
+    Accessible.name: label + ", " + value + " percent"
+    Accessible.role: Accessible.ProgressBar
     implicitHeight: progressLayout.implicitHeight
     height: implicitHeight
     ColumnLayout {
@@ -793,6 +1045,8 @@ Panel {
     property string buttonText: ""
     property string statusText: ""
     property bool active: false
+    readonly property bool actionHasFocus: actionButton.activeFocus
+    function focusAction() { if (actionButton.visible && actionButton.enabled) actionButton.forceActiveFocus() }
     signal triggered()
     implicitHeight: actionLayout.implicitHeight
     height: implicitHeight
@@ -823,15 +1077,22 @@ Panel {
         }
       }
       Button {
+        id: actionButton
         Layout.alignment: Qt.AlignVCenter
         visible: actionRow.statusText === ""
         text: actionRow.buttonText
         enabled: actionRow.enabled
         active: actionRow.active
         bordered: true
+        focusable: true
         foreground: root.foreground
         fontFamily: root.fontFamily
         fontSize: Style.font.bodySmall
+        Accessible.name: actionRow.label + ", " + actionRow.buttonText
+        Accessible.description: actionRow.caption
+        Accessible.role: Accessible.Button
+        Accessible.onPressAction: actionRow.triggered()
+        Keys.onEscapePressed: root.close()
         onClicked: actionRow.triggered()
       }
       Text {
@@ -850,6 +1111,9 @@ Panel {
   component ActionFeedback: Item {
     id: feedback
     property string kind: ""
+    Accessible.name: root.actionStatus !== "" ? root.actionStatus
+      : root.actionLabel + ", " + root.actionProgress + " percent"
+    Accessible.role: Accessible.StatusBar
     visible: root.actionKind === kind && (root.actionProgress > 0 || root.actionStatus !== "")
     implicitHeight: visible ? feedbackColumn.implicitHeight : 0
     height: implicitHeight

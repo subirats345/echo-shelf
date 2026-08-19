@@ -6,10 +6,11 @@ A small Omarchy Quattro bar widget for the Snowsky Echo Mini: connection and sto
 
 ## What it shows
 
-- `Overview` — USB Data or DAC state, occupied/total storage, usage percentage, and safe eject.
-- `Library` — track and album counts, a one-click Inbox, send-to-Echo status, and import status.
+- `Overview` — USB Data or DAC state, independent internal/SD mount state, occupied/total storage, usage percentage, and safe eject.
+- `Library` — track and album counts, a one-click Inbox, structured send/import status, and a direct path to review preserved conflicts.
 - `Firmware` — the installed version. Update controls appear only when action is required.
 - The bar icon disappears when the player is disconnected.
+- Cached details appear immediately while a fingerprinted background refresh runs.
 
 ## Deliberately absent
 
@@ -22,7 +23,7 @@ A small Omarchy Quattro bar widget for the Snowsky Echo Mini: connection and sto
 
 - Omarchy Quattro.
 - A Snowsky Echo Mini connected in USB Data or USB DAC mode.
-- Standard Omarchy tools used by the helper: `curl`, `rsync`, `unzip`, `zip`, `udisksctl`, `udevadm`, and `xdg-open`.
+- Standard Omarchy tools used by the helper: `curl`, `findmnt`, `flock`, `lsblk`, `rsync`, `sha256sum`, `timeout`, `unzip`, `zip`, `udisksctl`, `udevadm`, and `xdg-open`.
 
 No install hook, package installation, background service, or elevated access is used. The library features work with supported Echo Mini storage; the firmware flow is tested and restricted to the 8 GB model/package.
 
@@ -41,6 +42,8 @@ Update later with:
 omarchy plugin update io.github.subirats345.echo-shelf
 ```
 
+If Omarchy updates the files but the widget does not reload cleanly, run `omarchy-restart-shell` once. A missing icon normally means the Echo is not enumerating; repeated kernel `error -71` messages point to the USB cable or port rather than the plugin.
+
 ## Music transfer
 
 Echo Shelf creates these folders when needed:
@@ -54,13 +57,24 @@ The expected player layout is:
 01_Category/Album/track.flac
 ```
 
-Supported audio and album covers are copied. WavPack is reported as unsupported, files outside the numbered category layout are skipped, local import conflicts are preserved, and neither direction deletes music.
+Supported audio and album covers are copied. Non-music extras are silently ignored, unsupported audio such as WavPack is reported, files outside the numbered category layout are skipped, and neither direction deletes music. Transfers check free space before writing and use delayed updates so interrupted copies do not become final files.
+
+Local import conflicts are never overwritten or called up to date. Echo Shelf reports them, keeps the local copy, and offers to open the Library for review. Device operations are serialized so a background refresh cannot race an eject, transfer, or firmware write.
 
 ## Firmware
 
-Echo Shelf checks FiiO's official Echo Mini firmware page every six hours and caches the result. Preparing an update requires a clean Library import, validates the official 8 GB archive and image, records SHA-256 hashes, and backs up internal storage before any firmware copy.
+Echo Shelf checks FiiO's official Echo Mini firmware page every six hours and caches the result. Preparing an update requires a clean Library import, validates the official 8 GB archive and image structure, records SHA-256 hashes for copy integrity, and completes a marked internal-storage backup before any firmware copy. FiiO does not currently publish an independent package checksum, so Echo Shelf does not claim vendor-signature verification.
 
 Install remains a deliberate physical flow: safely eject, disconnect, remove the SD card, reconnect in USB Data, install, restart the Echo, then confirm the version shown on the player. Every write step requires explicit confirmation.
+
+## Recovery behavior
+
+- `UPDATING` keeps the last matching device snapshot visible while refreshing in the background.
+- Mount changes trigger a refresh even while the panel is closed.
+- Failed refreshes keep the last good snapshot, disable device actions, and retry with a bound.
+- Eject reports partial success when one volume unmounts and the other remains busy.
+- `Safe to disconnect` means Linux has confirmed that every mounted Echo volume is unmounted; the player's generic USB screen may still remain visible until the cable is removed.
+- Echo Shelf never runs filesystem repair automatically. If Linux reports that a FAT volume was not properly unmounted, repair it deliberately while the volume is unmounted.
 
 ## Keyboard
 
@@ -70,6 +84,8 @@ Install remains a deliberate physical flow: safely eject, disconnect, remove the
 | `l` / `2` | Library |
 | `f` / `3` | Firmware |
 | `←` / `→` | Previous or next tab |
+| `Tab` / `Shift+Tab` | Focus available actions |
+| `Enter` / `Space` | Activate the focused action |
 | `Esc` | Close panel |
 
 ## Test
