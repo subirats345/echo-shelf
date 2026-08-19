@@ -24,7 +24,7 @@ A small Omarchy Quattro bar widget for the Snowsky Echo Mini: connection and sto
 - A Snowsky Echo Mini connected in USB Data or USB DAC mode.
 - Standard Omarchy tools used by the helper: `curl`, `rsync`, `unzip`, `zip`, `udisksctl`, `udevadm`, and `xdg-open`.
 
-No install hook, package installation, service, root access, `sudo`, or `pkexec` is used. The library features work with supported Echo Mini storage; the firmware flow is tested and restricted to the 8 GB model/package.
+No install hook, package installation, background service, or elevated access is used. The library features work with supported Echo Mini storage; the firmware flow is tested and restricted to the 8 GB model/package.
 
 ## Install
 
