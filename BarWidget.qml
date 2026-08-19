@@ -44,6 +44,7 @@ Panel {
     || String(details.firmware || "").indexOf(" available") > 0
 
   function connectionMeta() {
+    if (detailsProbe.running) return mode === "dac" ? "USB DAC · UPDATING" : "USB DATA · UPDATING"
     if (mode === "dac") return "USB DAC · 48 KHZ"
     if (details.mounted === "yes") return "USB DATA · READY"
     if (details.internal_mounted === "yes") return "USB DATA · INTERNAL ONLY"
@@ -119,7 +120,7 @@ Panel {
   }
 
   function refreshDetails() {
-    if (opened && !actionRunning && !detailsProbe.running) detailsProbe.running = true
+    if (mode !== "disconnected" && !actionRunning && !detailsProbe.running) detailsProbe.running = true
   }
 
   function requestEject() {
@@ -212,9 +213,13 @@ Panel {
     command: [root.helperPath]
     onExited: function(exitCode) {
       var nextMode = exitCode === 10 ? "data" : exitCode === 20 ? "dac" : "disconnected"
+      var modeChanged = root.mode !== nextMode
       if (nextMode === "disconnected") root.close()
       root.mode = nextMode
-      if (root.opened) root.refreshDetails()
+      if (modeChanged && nextMode !== "disconnected") {
+        if (!cachedDetailsProbe.running) cachedDetailsProbe.running = true
+        root.refreshDetails()
+      }
     }
   }
 
@@ -273,6 +278,18 @@ Panel {
   }
 
   Process {
+    id: cachedDetailsProbe
+    command: [root.helperPath, "--cached-details"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var cached = Model.parseKeyValue(text)
+        if (cached.mode === root.mode) root.details = cached
+      }
+    }
+  }
+
+  Process {
     id: detailsProbe
     command: [root.helperPath, "--details"]
     stdout: StdioCollector {
@@ -304,7 +321,7 @@ Panel {
   Timer { id: firmwareInstallTimer; interval: 5000; onTriggered: root.firmwareInstallArmed = false }
 
   Timer {
-    interval: 5000
+    interval: 30000
     running: root.opened
     repeat: true
     onTriggered: root.refreshDetails()
@@ -432,6 +449,7 @@ Panel {
                 meta: root.storageUsage(root.details.internal)
                 percent: parseInt(root.details.internal_percent || "0", 10)
                 available: root.details.internal_mounted === "yes"
+                loading: detailsProbe.running && root.details.internal === undefined
               }
 
               StorageMeter {
@@ -440,6 +458,7 @@ Panel {
                 meta: root.storageUsage(root.details.sd)
                 percent: parseInt(root.details.sd_percent || "0", 10)
                 available: root.details.mounted === "yes"
+                loading: detailsProbe.running && root.details.sd === undefined
               }
             }
 
@@ -689,6 +708,7 @@ Panel {
     property string meta: "—"
     property int percent: 0
     property bool available: false
+    property bool loading: false
     implicitHeight: storageLayout.implicitHeight
     height: implicitHeight
     RowLayout {
@@ -722,7 +742,7 @@ Panel {
       }
       Text {
         Layout.preferredWidth: Style.space(40)
-        text: storageMeter.available ? storageMeter.percent + "%" : "—"
+        text: storageMeter.loading ? "…" : storageMeter.available ? storageMeter.percent + "%" : "—"
         color: root.foreground
         opacity: storageMeter.available ? 1.0 : 0.6
         font.family: root.fontFamily
@@ -731,7 +751,7 @@ Panel {
       }
       Text {
         Layout.preferredWidth: Style.space(62)
-        text: storageMeter.available ? storageMeter.meta : "Not mounted"
+        text: storageMeter.loading ? "Reading…" : storageMeter.available ? storageMeter.meta : "Not mounted"
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

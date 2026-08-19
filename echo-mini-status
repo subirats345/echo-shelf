@@ -8,6 +8,7 @@ cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/echo-shelf"
 firmware_config="$config_root/firmware-version"
 firmware_cache="$cache_root/latest-firmware"
 firmware_url_cache="$cache_root/latest-firmware-url"
+details_cache="$cache_root/details"
 firmware_pending="$config_root/firmware-pending"
 firmware_prepared="$config_root/firmware-prepared"
 firmware_url="https://forum.fiio.com/phoneNote/showNoteContent.do?id=202501210934383987154"
@@ -126,6 +127,11 @@ usage_percent() {
 
 emit_progress() {
   printf 'PROGRESS\t%s\t%s\n' "$1" "$2"
+}
+
+read_cached_details() {
+  [[ -f "$details_cache" ]] || return 1
+  cat "$details_cache"
 }
 
 track_count() {
@@ -616,6 +622,59 @@ sync_to_echo() {
   echo "Sync complete · $preview"
 }
 
+emit_details() {
+  printf 'mode\t%s\n' "$mode"
+  case "$mode" in
+    data)
+      local mounted=no
+      [[ -n "$internal_mount" && -n "$sd_mount" ]] && mounted=yes
+      printf 'title\tUSB Data\nmounted\t%s\ninternal_mounted\t%s\nsd_present\t%s\nplugin\t%s\ndevice\t%s\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\t%s\ninternal_percent\t%s\nsd\t%s\nsd_percent\t%s\ntracks\t%s\nalbums\t%s\nformats\t%s FLAC · %s M4A\ncategories\t%s\nmanifests\t%s\ncleanup\t%s\nsync\t%s\nimport\t%s\n' \
+        "$mounted" \
+        "$([[ -n "$internal_mount" ]] && echo yes || echo no)" \
+        "$([[ -n "$sd_device" ]] && echo yes || echo no)" \
+        "$(plugin_version)" "$(device_status)" "$(firmware_status)" \
+        "$(firmware_installed_version)" \
+        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
+        "$(firmware_backup_status)" \
+        "$(firmware_pending_status)" "$(firmware_pending_version)" \
+        "$(firmware_prepared_status)" "$(firmware_prepared_version)" \
+        "$(usage "$internal_mount")" "$(usage_percent "$internal_mount")" \
+        "$(usage "$sd_mount")" "$(usage_percent "$sd_mount")" "$(track_count)" \
+        "$(album_count)" "$(file_count '*.flac')" "$(file_count '*.m4a')" \
+        "$(category_count)" "$(manifest_status)" "$(cleanup_status)" \
+        "$(sync_preview)" "$(import_preview)"
+      ;;
+    dac)
+      printf 'title\tUSB DAC · 48 kHz\nmounted\tno\ninternal_mounted\tno\nsd_present\tno\nplugin\t%s\ndevice\tUSB DAC\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\tUnavailable in DAC mode\ninternal_percent\t0\nsd\tUnavailable in DAC mode\nsd_percent\t0\ntracks\t—\nalbums\t—\nformats\t—\ncategories\t—\nmanifests\t—\ncleanup\t—\nsync\t—\nimport\t—\n' \
+        "$(plugin_version)" "$(firmware_status)" \
+        "$(firmware_installed_version)" \
+        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
+        "$(firmware_backup_status)" \
+        "$(firmware_pending_status)" "$(firmware_pending_version)" \
+        "$(firmware_prepared_status)" "$(firmware_prepared_version)"
+      ;;
+    *)
+      printf 'title\tDisconnected\nmounted\tno\ninternal_mounted\tno\nsd_present\tno\nplugin\t%s\ndevice\t—\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\t—\ninternal_percent\t0\nsd\t—\nsd_percent\t0\ntracks\t—\nalbums\t—\nformats\t—\ncategories\t—\nmanifests\t—\ncleanup\t—\nsync\t—\nimport\t—\n' \
+        "$(plugin_version)" "$(firmware_status)" \
+        "$(firmware_installed_version)" \
+        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
+        "$(firmware_backup_status)" \
+        "$(firmware_pending_status)" "$(firmware_pending_version)" \
+        "$(firmware_prepared_status)" "$(firmware_prepared_version)"
+      ;;
+  esac
+}
+
+refresh_details_cache() {
+  local temporary
+  [[ "$mode" != disconnected ]] || { emit_details; return; }
+  mkdir -p "$cache_root" || { emit_details; return; }
+  temporary="$(mktemp "$cache_root/.details.XXXXXX")" || { emit_details; return; }
+  emit_details > "$temporary"
+  cat "$temporary"
+  mv "$temporary" "$details_cache"
+}
+
 if [[ "${1:-}" == "--self-test" ]]; then
   test_root="$(mktemp -d)"
   trap 'rm -r "$test_root"' EXIT
@@ -636,6 +695,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(manifest_status)" == Ready ]]
   [[ "$(cleanup_status)" == "1 AppleDouble files" ]]
   [[ "$(emit_progress 42 Testing)" == $'PROGRESS\t42\tTesting' ]]
+  details_cache="$test_root/details"
+  printf 'mode\tdata\nsd\t7.2G / 234G\n' > "$details_cache"
+  [[ "$(read_cached_details)" == $'mode\tdata\nsd\t7.2G / 234G' ]]
+  rm "$details_cache"
+  ! read_cached_details
   valid_properties=$'DEVTYPE=partition\nID_VENDOR_ID=071b\nID_MODEL_ID=3203\nID_MODEL=MINI\n'
   valid_echo_properties "$valid_properties" MINI
   ! valid_echo_properties "$valid_properties" MINI_SD
@@ -744,47 +808,13 @@ if [[ "${1:-}" == "--import-from-echo" ]]; then
   exit
 fi
 
+if [[ "${1:-}" == "--cached-details" ]]; then
+  read_cached_details
+  exit
+fi
+
 if [[ "${1:-}" == "--details" ]]; then
-  printf 'mode\t%s\n' "$mode"
-  case "$mode" in
-    data)
-      mounted=no
-      [[ -n "$internal_mount" && -n "$sd_mount" ]] && mounted=yes
-      printf 'title\tUSB Data\nmounted\t%s\ninternal_mounted\t%s\nsd_present\t%s\nplugin\t%s\ndevice\t%s\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\t%s\ninternal_percent\t%s\nsd\t%s\nsd_percent\t%s\ntracks\t%s\nalbums\t%s\nformats\t%s FLAC · %s M4A\ncategories\t%s\nmanifests\t%s\ncleanup\t%s\nsync\t%s\nimport\t%s\n' \
-        "$mounted" \
-        "$([[ -n "$internal_mount" ]] && echo yes || echo no)" \
-        "$([[ -n "$sd_device" ]] && echo yes || echo no)" \
-        "$(plugin_version)" "$(device_status)" "$(firmware_status)" \
-        "$(firmware_installed_version)" \
-        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
-        "$(firmware_backup_status)" \
-        "$(firmware_pending_status)" "$(firmware_pending_version)" \
-        "$(firmware_prepared_status)" "$(firmware_prepared_version)" \
-        "$(usage "$internal_mount")" "$(usage_percent "$internal_mount")" \
-        "$(usage "$sd_mount")" "$(usage_percent "$sd_mount")" "$(track_count)" \
-        "$(album_count)" "$(file_count '*.flac')" "$(file_count '*.m4a')" \
-        "$(category_count)" "$(manifest_status)" "$(cleanup_status)" \
-        "$(sync_preview)" "$(import_preview)"
-      ;;
-    dac)
-      printf 'title\tUSB DAC · 48 kHz\nmounted\tno\ninternal_mounted\tno\nsd_present\tno\nplugin\t%s\ndevice\tUSB DAC\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\tUnavailable in DAC mode\ninternal_percent\t0\nsd\tUnavailable in DAC mode\nsd_percent\t0\ntracks\t—\nalbums\t—\nformats\t—\ncategories\t—\nmanifests\t—\ncleanup\t—\nsync\t—\nimport\t—\n' \
-        "$(plugin_version)" "$(firmware_status)" \
-        "$(firmware_installed_version)" \
-        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
-        "$(firmware_backup_status)" \
-        "$(firmware_pending_status)" "$(firmware_pending_version)" \
-        "$(firmware_prepared_status)" "$(firmware_prepared_version)"
-      ;;
-    *)
-      printf 'title\tDisconnected\nmounted\tno\ninternal_mounted\tno\nsd_present\tno\nplugin\t%s\ndevice\t—\nfirmware\t%s\nfirmware_installed\t%s\nfirmware_latest\t%s\nfirmware_backup\t%s\nfirmware_pending\t%s\nfirmware_pending_version\t%s\nfirmware_prepared\t%s\nfirmware_prepared_version\t%s\ninternal\t—\ninternal_percent\t0\nsd\t—\nsd_percent\t0\ntracks\t—\nalbums\t—\nformats\t—\ncategories\t—\nmanifests\t—\ncleanup\t—\nsync\t—\nimport\t—\n' \
-        "$(plugin_version)" "$(firmware_status)" \
-        "$(firmware_installed_version)" \
-        "$([[ -f "$firmware_cache" ]] && head -n 1 "$firmware_cache" || echo unknown)" \
-        "$(firmware_backup_status)" \
-        "$(firmware_pending_status)" "$(firmware_pending_version)" \
-        "$(firmware_prepared_status)" "$(firmware_prepared_version)"
-      ;;
-  esac
+  refresh_details_cache
   exit
 fi
 
