@@ -79,11 +79,10 @@ Panel {
 
   function connectionMeta() {
     if (mode === "error") return "PLUGIN ERROR"
-    if (detailsProbe.running) return mode === "dac" ? "USB DAC · UPDATING" : "USB DATA · UPDATING"
-    if (detailsRefreshFailed) return mode === "dac"
-      ? (refreshRetryCount < 3 ? "USB DAC · RETRYING" : "USB DAC · REFRESH FAILED")
-      : (refreshRetryCount < 3 ? "USB DATA · RETRYING" : "USB DATA · REFRESH FAILED")
-    if (mode === "dac") return "USB DAC"
+    if (mode === "dac") return "USB DAC MODE · AUDIO ONLY"
+    if (detailsProbe.running) return "USB DATA · UPDATING"
+    if (detailsRefreshFailed) return refreshRetryCount < 3
+      ? "USB DATA · RETRYING" : "USB DATA · REFRESH FAILED"
     if (details.device_error) return "USB DATA · CHECK DEVICES"
     if (internalMounted && sdMounted) return "USB DATA · READY"
     if (mountRetryCount > 0 && ((internalPresent && !internalMounted) || (sdPresent && !sdMounted)))
@@ -108,7 +107,7 @@ Panel {
     if (syncUpdated > 0) work.push(syncUpdated + " updated")
     if (syncSkipped > 0) work.push(syncSkipped + " skipped")
     if (syncUnsupported > 0) work.push(syncUnsupported + " unsupported audio")
-    return work.join(" · ")
+    return work.length > 0 ? work.join(" · ") : "Computer → Echo SD card"
   }
 
   function importSummary() {
@@ -119,7 +118,7 @@ Panel {
     if (importConflicts > 0) work.push(importConflicts + " conflict" + (importConflicts === 1 ? " · local kept" : "s · local kept"))
     if (importSkipped > 0) work.push(importSkipped + " skipped")
     if (importUnsupported > 0) work.push(importUnsupported + " unsupported audio")
-    return work.join(" · ")
+    return work.length > 0 ? work.join(" · ") : "Echo Shelf / Local Copy · up to date"
   }
 
   function firmwareSummary() {
@@ -220,15 +219,15 @@ Panel {
   }
 
   function requestImport() {
-    if (mode !== "data" || !deviceReady || !sdMounted || actionRunning || importCurrent) return
-    if (importNew === 0 && importConflicts > 0) {
+    if (mode !== "data" || !deviceReady || !sdMounted || actionRunning) return
+    if (importCurrent || (importNew === 0 && importConflicts > 0)) {
       if (!openLibraryProbe.running) openLibraryProbe.running = true
       return
     }
     if (!importArmed) {
       cancelArms(); importArmed = true; return
     }
-    startAction("library", "Checking Echo library", 1)
+    startAction("library", "Checking music on Echo", 1)
     importProbe.running = true
   }
 
@@ -339,6 +338,7 @@ Panel {
       if (modeChanged || connectionChanged) {
         root.cancelArms()
         root.clearAction()
+        root.activeTab = "overview"
         root.detailsRefreshFailed = false
         root.mountRetryCount = nextMode === "data" ? 5 : 0
         root.refreshRetryCount = 0
@@ -396,14 +396,14 @@ Panel {
     id: importProbe
     command: [root.helperPath, "--import-from-echo"]
     stdout: SplitParser { onRead: function(line) { root.handleActionLine(line) } }
-    onExited: function(exitCode) { root.finishAction(exitCode, "Library updated", "Import failed") }
+    onExited: function(exitCode) { root.finishAction(exitCode, "Local music copy updated", "Copy failed") }
   }
 
   Process {
     id: syncProbe
     command: [root.helperPath, "--sync-to-echo"]
     stdout: SplitParser { onRead: function(line) { root.handleActionLine(line) } }
-    onExited: function(exitCode) { root.finishAction(exitCode, "Echo library updated", "Sync failed") }
+    onExited: function(exitCode) { root.finishAction(exitCode, "Music copied to Echo", "Copy failed") }
   }
 
   Process {
@@ -546,7 +546,7 @@ Panel {
       onTextKey: function(text) {
         var key = String(text).toLowerCase()
         if (key === "1" || key === "o") root.activeTab = "overview"
-        else if (key === "2" || key === "l") root.activeTab = "library"
+        else if (key === "2" || key === "l" || key === "m") root.activeTab = "library"
         else if (key === "3" || key === "f") root.activeTab = "firmware"
       }
 
@@ -580,15 +580,16 @@ Panel {
           }
 
           Item {
+            visible: root.mode !== "dac"
             width: parent.width
-            implicitHeight: tabs.implicitHeight
+            implicitHeight: visible ? tabs.implicitHeight : 0
 
             ButtonGroup {
               id: tabs
               anchors.horizontalCenter: parent.horizontalCenter
               options: [
                 { value: "overview", label: "Overview" },
-                { value: "library", label: "Library" },
+                { value: "library", label: "Music" },
                 { value: "firmware", label: "Firmware" }
               ]
               value: root.activeTab
@@ -600,10 +601,10 @@ Panel {
             }
           }
 
-          PanelSeparator { width: parent.width; foreground: root.foreground }
+          PanelSeparator { visible: root.mode !== "dac"; width: parent.width; foreground: root.foreground }
 
           Column {
-            visible: root.activeTab === "overview"
+            visible: root.mode !== "dac" && root.activeTab === "overview"
             width: parent.width
             spacing: Style.space(12)
 
@@ -611,14 +612,6 @@ Panel {
               text: root.mode === "data" ? "STORAGE" : "CONNECTION"
               foreground: root.foreground
               fontFamily: root.fontFamily
-            }
-
-            ValueRow {
-              visible: root.mode === "dac"
-              width: parent.width
-              label: "Connection"
-              value: "USB DAC"
-              caption: "Audio mode"
             }
 
             ValueRow {
@@ -672,11 +665,11 @@ Panel {
           }
 
           Column {
-            visible: root.activeTab === "library"
+            visible: root.mode !== "dac" && root.activeTab === "library"
             width: parent.width
             spacing: Style.space(12)
 
-            PanelSectionHeader { text: "LIBRARY"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader { text: "ON THE ECHO"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             Row {
               width: parent.width
@@ -686,13 +679,13 @@ Panel {
             }
 
             PanelSeparator { width: parent.width; foreground: root.foreground }
-            PanelSectionHeader { text: "TRANSFER"; foreground: root.foreground; fontFamily: root.fontFamily }
+            PanelSectionHeader { text: "TO ECHO"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             ActionRow {
               id: inboxRow
               width: parent.width
-              label: "Inbox"
-              caption: "Add music here"
+              label: "Music to send"
+              caption: "Echo Shelf / To Echo"
               buttonText: "Open"
               enabled: !openInboxProbe.running
               onTriggered: root.requestOpenInbox()
@@ -701,10 +694,10 @@ Panel {
             ActionRow {
               id: syncRow
               width: parent.width
-              label: "Send to Echo"
+              label: "Copy to Echo"
               caption: root.syncSummary()
-              statusText: root.syncCurrent ? "SYNCED" : ""
-              buttonText: root.syncArmed ? "Confirm send" : "Send"
+              statusText: root.syncCurrent ? "UP TO DATE" : ""
+              buttonText: root.syncArmed ? "Confirm copy" : "Copy"
               enabled: root.mode === "data" && root.deviceReady && root.sdMounted
                 && !root.actionRunning
                 && !root.syncCurrent
@@ -712,17 +705,18 @@ Panel {
               onTriggered: root.requestSync()
             }
 
+            PanelSectionHeader { text: "FROM ECHO"; foreground: root.foreground; fontFamily: root.fontFamily }
+
             ActionRow {
               id: importRow
               width: parent.width
-              label: "Import from Echo"
+              label: "Local music copy"
               caption: root.importSummary()
-              statusText: root.importCurrent ? "UP TO DATE" : ""
-              buttonText: root.importNew === 0 && root.importConflicts > 0 ? "Open library"
-                : root.importArmed ? "Confirm import" : "Import"
+              buttonText: root.importCurrent ? "Open"
+                : root.importNew === 0 && root.importConflicts > 0 ? "Review"
+                : root.importArmed ? "Confirm copy" : "Copy"
               enabled: root.mode === "data" && root.deviceReady && root.sdMounted
                 && !root.actionRunning
-                && !root.importCurrent
               active: root.importArmed
               onTriggered: root.requestImport()
             }
@@ -731,7 +725,7 @@ Panel {
           }
 
           Column {
-            visible: root.activeTab === "firmware"
+            visible: root.mode !== "dac" && root.activeTab === "firmware"
             width: parent.width
             spacing: Style.space(12)
 

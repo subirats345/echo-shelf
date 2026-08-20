@@ -5,6 +5,7 @@ set -u
 plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 config_root="${XDG_CONFIG_HOME:-$HOME/.config}/echo-shelf"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/echo-shelf"
+data_root="${XDG_DATA_HOME:-$HOME/.local/share}/echo-shelf"
 firmware_config="$config_root/firmware-version"
 firmware_cache="$cache_root/latest-firmware"
 firmware_url_cache="$cache_root/latest-firmware-url"
@@ -27,10 +28,43 @@ mount_token=disconnected
 echo_fingerprint=unknown
 music_root="$(xdg-user-dir MUSIC 2>/dev/null || true)"
 [[ -n "$music_root" ]] || music_root="$HOME/Music"
-inbox="$music_root/Echo Shelf Inbox"
-library="$music_root/Echo Shelf Library"
+shelf_root="$music_root/Echo Shelf"
+inbox="$shelf_root/To Echo"
+library="$shelf_root/Local Copy"
+legacy_inbox="$music_root/Echo Shelf Inbox"
+legacy_library="$music_root/Echo Shelf Library"
 firmware_store="$cache_root/firmware"
-firmware_backup_root="$music_root/Echo Shelf Firmware Backups"
+legacy_firmware_backup_root="$music_root/Echo Shelf Firmware Backups"
+firmware_backup_root="$data_root/firmware-backups"
+
+migrate_legacy_firmware_backups() {
+  [[ -d "$legacy_firmware_backup_root" && ! -e "$firmware_backup_root" ]] || return 0
+  mkdir -p "$data_root" && mv -- "$legacy_firmware_backup_root" "$firmware_backup_root"
+}
+
+folder_has_entries() {
+  [[ -d "$1" ]] && find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .
+}
+
+migrate_legacy_music_folders() {
+  local source target
+  for source in "$legacy_inbox" "$legacy_library"; do
+    [[ "$source" == "$legacy_inbox" ]] && target="$inbox" || target="$library"
+    [[ -d "$source" ]] || continue
+    if [[ -e "$target" ]]; then
+      [[ -d "$target" ]] || return 1
+      ! folder_has_entries "$target" || return 1
+    fi
+  done
+
+  mkdir -p "$shelf_root" || return 1
+  for source in "$legacy_inbox" "$legacy_library"; do
+    [[ "$source" == "$legacy_inbox" ]] && target="$inbox" || target="$library"
+    [[ -d "$source" ]] || continue
+    [[ ! -d "$target" ]] || rmdir -- "$target" || return 1
+    mv -- "$source" "$target" || return 1
+  done
+}
 
 ensure_inbox() {
   [[ -d "$inbox" ]] || mkdir -p "$inbox"
@@ -475,6 +509,7 @@ firmware_installed_version() {
 
 firmware_backup_status() {
   local path_file backup
+  migrate_legacy_firmware_backups >/dev/null 2>&1 || true
   for path_file in "$firmware_store"/*/backup-path; do
     [[ -f "$path_file" ]] || continue
     read -r backup < "$path_file"
@@ -483,7 +518,7 @@ firmware_backup_status() {
       : > "$backup/.echo-shelf-backup-complete"
     fi
   done
-  find "$firmware_backup_root" -mindepth 2 -maxdepth 2 -type f \
+  find "$firmware_backup_root" "$legacy_firmware_backup_root" -mindepth 2 -maxdepth 2 -type f \
     -name '.echo-shelf-backup-complete' -print -quit 2>/dev/null \
     | grep -q . && echo yes || echo no
 }
@@ -649,6 +684,8 @@ prepare_firmware() (
     || { echo "Firmware image SHA-256 does not match this Echo Shelf release"; return 1; }
 
   emit_progress 65 "Backing up internal storage"
+  mkdir -p "$firmware_backup_root" \
+    || { echo "Could not create firmware backup storage"; return 1; }
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   backup="$firmware_backup_root/${timestamp}-pre-${version}"
   mkdir -p "$backup"
@@ -1102,6 +1139,23 @@ if [[ "${1:-}" == "--self-test" ]]; then
   trap 'rm -r "$test_root"' EXIT
   firmware_store="$test_root/firmware-store"
   mkdir -p "$firmware_store"
+  music_root="$test_root/music"
+  shelf_root="$music_root/Echo Shelf"
+  inbox="$shelf_root/To Echo"
+  library="$shelf_root/Local Copy"
+  legacy_inbox="$music_root/Echo Shelf Inbox"
+  legacy_library="$music_root/Echo Shelf Library"
+  mkdir -p "$legacy_inbox" "$legacy_library"
+  touch "$legacy_inbox/outbound.flac" "$legacy_library/local.flac"
+  migrate_legacy_music_folders
+  [[ -f "$inbox/outbound.flac" && -f "$library/local.flac" ]]
+  [[ ! -e "$legacy_inbox" && ! -e "$legacy_library" ]]
+  rm -r "$music_root"
+  mkdir -p "$legacy_inbox" "$inbox"
+  touch "$legacy_inbox/old.flac" "$inbox/new.flac"
+  ! migrate_legacy_music_folders
+  [[ -f "$legacy_inbox/old.flac" && -f "$inbox/new.flac" ]]
+  rm -r "$music_root"
   inbox="$test_root/auto-inbox"
   ensure_inbox
   [[ -d "$inbox" ]]
@@ -1174,8 +1228,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$validated_image_name" == HIFIEC38.IMG ]]
   has_required_space 100 40 60
   ! has_required_space 99 40 60
-  firmware_backup_root="$test_root/backups"
-  mkdir -p "$firmware_backup_root/incomplete" "$firmware_backup_root/complete"
+  data_root="$test_root/data"
+  legacy_firmware_backup_root="$test_root/legacy-backups"
+  firmware_backup_root="$data_root/firmware-backups"
+  mkdir -p "$legacy_firmware_backup_root/incomplete"
+  migrate_legacy_firmware_backups
+  [[ ! -e "$legacy_firmware_backup_root" && -d "$firmware_backup_root/incomplete" ]]
+  mkdir -p "$firmware_backup_root/complete"
   [[ "$(firmware_backup_status)" == no ]]
   touch "$firmware_backup_root/complete/.echo-shelf-backup-complete"
   [[ "$(firmware_backup_status)" == yes ]]
@@ -1244,6 +1303,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit
 fi
 
+migrate_legacy_music_folders >/dev/null 2>&1 || {
+  runtime_error="Both old and grouped music folders contain files"
+  mode=error
+}
 ensure_inbox >/dev/null 2>&1 || true
 check_runtime >/dev/null 2>&1 || true
 [[ "$mode" == error ]] || scan_devices
