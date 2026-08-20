@@ -23,15 +23,16 @@ latest_from_page() {
 }
 
 validate_archive() {
-  local archive="$1" version="$2" image="$3" entry count size
+  local archive="$1" version="$2" image="$3" entry count size image_name
   unzip -tqq "$archive" >/dev/null 2>&1 || return 1
   entry="$(LC_ALL=C unzip -Z1 "$archive" | LC_ALL=C grep -E '(^|/)HIFIEC[0-9]+\.IMG$' | head -n 1)"
   count="$(LC_ALL=C unzip -Z1 "$archive" | LC_ALL=C grep -Ec '(^|/)HIFIEC[0-9]+\.IMG$' || true)"
   [[ "$count" == 1 && "$entry" == *"V${version}-8G"* ]] || return 1
-  unzip -p "$archive" "$entry" > "$image"
+  image_name="${entry##*/}"
+  unzip -p "$archive" "*/$image_name" > "$image"
   size="$(file_size "$image")"
   ((size >= 16777216 && size <= 67108864)) || return 1
-  printf '%s\n' "${entry##*/}"
+  printf '%s\n' "$image_name"
 }
 
 bump_plugin_patch() {
