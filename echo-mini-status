@@ -591,7 +591,7 @@ validate_firmware_package() {
   [[ "$count" == 1 && -n "$entry" ]] || return 1
   [[ "$entry" == *"V${version}-8G"* ]] || return 1
   validated_image_name="${entry##*/}"
-  unzip -p "$archive" "$entry" > "$output" || return 1
+  unzip -p "$archive" "*/$validated_image_name" > "$output" || return 1
   size="$(file_size "$output")"
   ((size >= 16777216 && size <= 67108864)) || return 1
 }
