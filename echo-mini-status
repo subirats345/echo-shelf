@@ -502,6 +502,33 @@ firmware_feed_status() {
   ((age <= 43200)) && echo fresh || echo stale
 }
 
+trusted_firmware_metadata() {
+  local version="${1:-}" trust_file="$plugin_dir/firmware-trust.tsv" line count url archive_hash image_hash image_name
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -f "$trust_file" ]] || return 1
+  line="$(awk -F '\t' -v version="$version" '$1 == version { print $2 "\t" $3 "\t" $4 "\t" $5 }' "$trust_file")"
+  count="$(awk -F '\t' -v version="$version" '$1 == version { count++ } END { print count+0 }' "$trust_file")"
+  [[ "$count" == 1 ]] || return 1
+  IFS=$'\t' read -r url archive_hash image_hash image_name <<<"$line"
+  [[ "$url" == https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/*"V${version}-8G.zip" \
+      && "$archive_hash" =~ ^[0-9a-f]{64}$ && "$image_hash" =~ ^[0-9a-f]{64}$ \
+      && "$image_name" =~ ^HIFIEC[0-9]+\.IMG$ ]] || return 1
+  printf '%s\n' "$line"
+}
+
+firmware_source_trusted() {
+  local metadata expected_url
+  metadata="$(trusted_firmware_metadata "${1:-}")" || return 1
+  IFS=$'\t' read -r expected_url _ <<<"$metadata"
+  [[ "${2:-}" == "$expected_url" ]]
+}
+
+file_matches_sha256() {
+  local file="$1" expected="$2" actual
+  [[ -f "$file" && "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+  actual="$(sha256sum "$file" | awk '{ print $1 }')" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
 mark_firmware_pending() {
   local version="${1:-}" latest temporary
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
@@ -559,10 +586,10 @@ firmware_prepared_version() {
 validate_firmware_package() {
   local archive="$1" version="$2" output="$3" entry count size
   unzip -tqq "$archive" >/dev/null 2>&1 || return 1
-  entry="$(unzip -Z1 "$archive" | grep -E '(^|/)HIFIEC[0-9]+\.IMG$' | head -n 1)"
-  count="$(unzip -Z1 "$archive" | grep -Ec '(^|/)HIFIEC[0-9]+\.IMG$' || true)"
+  entry="$(LC_ALL=C unzip -Z1 "$archive" | LC_ALL=C grep -E '(^|/)HIFIEC[0-9]+\.IMG$' | head -n 1)"
+  count="$(LC_ALL=C unzip -Z1 "$archive" | LC_ALL=C grep -Ec '(^|/)HIFIEC[0-9]+\.IMG$' || true)"
   [[ "$count" == 1 && -n "$entry" ]] || return 1
-  [[ "$entry" == *"V${version}-8G/"* ]] || return 1
+  [[ "$entry" == *"V${version}-8G"* ]] || return 1
   validated_image_name="${entry##*/}"
   unzip -p "$archive" "$entry" > "$output" || return 1
   size="$(file_size "$output")"
@@ -571,7 +598,7 @@ validate_firmware_package() {
 
 prepare_firmware() (
   local version download_url version_dir workdir archive image image_name
-  local zip_hash image_hash timestamp backup temporary
+  local trusted_metadata trusted_url zip_hash image_hash trusted_image_name timestamp backup temporary
   local state new conflicts unchanged skipped unsupported
   workdir=
   trap '[[ -z "$workdir" || ! -d "$workdir" ]] || rm -r -- "$workdir"' EXIT
@@ -596,8 +623,11 @@ prepare_firmware() (
   read -r version < "$firmware_cache"
   read -r download_url < "$firmware_url_cache"
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
-  [[ "$download_url" == https://fiio-firmware.*"V${version}-8G.zip" ]] \
-    || { echo "Official 8GB firmware URL validation failed"; return 1; }
+  trusted_metadata="$(trusted_firmware_metadata "$version")" \
+    || { echo "Firmware $version is not trusted by this Echo Shelf release"; return 1; }
+  IFS=$'\t' read -r trusted_url zip_hash image_hash trusted_image_name <<<"$trusted_metadata"
+  firmware_source_trusted "$version" "$download_url" \
+    || { echo "Official firmware URL does not match trusted release metadata"; return 1; }
 
   mkdir -p "$firmware_store"
   version_dir="$firmware_store/$version"
@@ -608,12 +638,15 @@ prepare_firmware() (
   emit_progress 25 "Downloading firmware"
   curl -LfsS --proto '=https' --tlsv1.2 --max-time 120 "$download_url" -o "$archive" \
     || { echo "Firmware download failed"; return 1; }
+  emit_progress 45 "Verifying trusted archive"
+  file_matches_sha256 "$archive" "$zip_hash" \
+    || { echo "Firmware archive SHA-256 does not match this Echo Shelf release"; return 1; }
   emit_progress 50 "Validating package"
   validate_firmware_package "$archive" "$version" "$image" \
     || { echo "Firmware package validation failed"; return 1; }
   image_name="$validated_image_name"
-  zip_hash="$(sha256sum "$archive" | awk '{ print $1 }')"
-  image_hash="$(sha256sum "$image" | awk '{ print $1 }')"
+  [[ "$image_name" == "$trusted_image_name" ]] && file_matches_sha256 "$image" "$image_hash" \
+    || { echo "Firmware image SHA-256 does not match this Echo Shelf release"; return 1; }
 
   emit_progress 65 "Backing up internal storage"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -642,7 +675,8 @@ prepare_firmware() (
 )
 
 install_prepared_firmware() (
-  local version version_dir image_name image expected_hash actual_hash target temporary_target
+  local version version_dir image_name image expected_hash recorded_hash target temporary_target
+  local trusted_metadata trusted_url trusted_archive_hash trusted_image_name
   temporary_target=
   trap '[[ -z "$temporary_target" || ! -f "$temporary_target" ]] || rm -f -- "$temporary_target"' EXIT
   emit_progress 10 "Validating prepared firmware"
@@ -657,16 +691,22 @@ install_prepared_firmware() (
   [[ "$(device_status)" == 8GB* ]] || { echo "Expected the 8GB Echo Mini"; return 1; }
   [[ "$(firmware_prepared_status)" == yes ]] || { echo "No prepared firmware"; return 1; }
   version="$(firmware_prepared_version)"
+  trusted_metadata="$(trusted_firmware_metadata "$version")" \
+    || { echo "Firmware $version is not trusted by this Echo Shelf release"; return 1; }
+  IFS=$'\t' read -r trusted_url trusted_archive_hash expected_hash trusted_image_name \
+    <<<"$trusted_metadata"
   version_dir="$firmware_store/$version"
   [[ -f "$version_dir/image-name" ]] || { echo "Prepared firmware metadata missing"; return 1; }
   read -r image_name < "$version_dir/image-name"
-  [[ "$image_name" =~ ^HIFIEC[0-9]+\.IMG$ ]] \
-    || { echo "Prepared firmware image name is invalid"; return 1; }
+  [[ "$image_name" == "$trusted_image_name" ]] \
+    || { echo "Prepared firmware image name is not trusted"; return 1; }
   image="$version_dir/$image_name"
   [[ -f "$image" && -f "$image.sha256" ]] || { echo "Prepared firmware files missing"; return 1; }
-  expected_hash="$(awk 'NR == 1 { print $1 }' "$image.sha256")"
-  actual_hash="$(sha256sum "$image" | awk '{ print $1 }')"
-  [[ "$actual_hash" == "$expected_hash" ]] || { echo "Prepared firmware checksum failed"; return 1; }
+  recorded_hash="$(awk 'NR == 1 { print $1 }' "$image.sha256")"
+  [[ "$recorded_hash" == "$expected_hash" ]] \
+    || { echo "Prepared firmware metadata is not trusted"; return 1; }
+  file_matches_sha256 "$image" "$expected_hash" \
+    || { echo "Prepared firmware SHA-256 does not match this Echo Shelf release"; return 1; }
   ! find "$internal_mount" -maxdepth 1 -type f -iname '*.img' -print -quit | grep -q . \
     || { echo "An existing firmware image is already on the Echo"; return 1; }
   has_required_space "$(df -PB1 "$internal_mount" | awk 'NR == 2 { print $4 }')" \
@@ -1103,6 +1143,27 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$(confirm_firmware)" == "3.8.0 installed · confirmed" ]]
   [[ "$(firmware_status)" == "3.8.0 · up to date" ]]
   [[ "$(firmware_pending_status)" == no ]]
+  trusted_metadata="$(trusted_firmware_metadata 3.8.0)"
+  [[ "$trusted_metadata" == $'https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V3.8.0-8G.zip\tff88080c928c76d80e1fd94d00152f20b4b05b6d11096b73076b8590a4e59591\ta697e317ef81e0de66d76f365b2198edc352ae0ac14d8adba2b6bf87050118d4\tHIFIEC38.IMG' ]]
+  ! trusted_firmware_metadata 3.9.0
+  trusted_url="${trusted_metadata%%$'\t'*}"
+  firmware_source_trusted 3.8.0 "$trusted_url"
+  ! firmware_source_trusted 3.8.0 "$trusted_url?changed=1"
+  ! firmware_source_trusted 3.9.0 "$trusted_url"
+  printf 'trusted firmware fixture' > "$test_root/trusted-firmware"
+  file_matches_sha256 "$test_root/trusted-firmware" \
+    a7ea65406afc53d44bf88d88cf45a61bf4b158f8f37363dcf906bcd1ced14b76
+  ! file_matches_sha256 "$test_root/trusted-firmware" \
+    07ea65406afc53d44bf88d88cf45a61bf4b158f8f37363dcf906bcd1ced14b76
+  if [[ -n "${ECHO_SHELF_TEST_FIRMWARE_ARCHIVE:-}" ]]; then
+    IFS=$'\t' read -r trusted_url trusted_archive_hash trusted_image_hash trusted_image_name \
+      <<<"$trusted_metadata"
+    file_matches_sha256 "$ECHO_SHELF_TEST_FIRMWARE_ARCHIVE" "$trusted_archive_hash"
+    validate_firmware_package "$ECHO_SHELF_TEST_FIRMWARE_ARCHIVE" 3.8.0 \
+      "$test_root/trusted-firmware.IMG"
+    [[ "$validated_image_name" == "$trusted_image_name" ]]
+    file_matches_sha256 "$test_root/trusted-firmware.IMG" "$trusted_image_hash"
+  fi
   mkdir -p "$test_root/package/ECHO MINI V3.8.0-8G"
   dd if=/dev/zero of="$test_root/package/ECHO MINI V3.8.0-8G/HIFIEC38.IMG" \
     bs=1048576 count=16 status=none

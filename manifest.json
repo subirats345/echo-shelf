@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.subirats345.echo-shelf",
   "name": "Echo Shelf",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Joan Subirats",
   "description": "A focused Overview, Library, and Firmware panel for the Snowsky Echo Mini.",
   "kinds": ["bar-widget"],

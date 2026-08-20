@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+trust_file="${ECHO_SHELF_TRUST_FILE:-$repo_dir/firmware-trust.tsv}"
+manifest_file="${ECHO_SHELF_MANIFEST:-$repo_dir/manifest.json}"
+firmware_page='https://forum.fiio.com/phoneNote/showNoteContent.do?id=202501210934383987154'
+
+file_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1"
+}
+
+latest_from_page() {
+  local page="$1" version url
+  version="$(grep -oE 'ECHO MINI[^<]{0,80}V[0-9]+\.[0-9]+\.[0-9]+' <<<"$page" \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -Vu | tail -n 1)"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  url="$(grep -oE "https?[^\"<> ]+V${version}-8G\\.zip" <<<"$page" | head -n 1)"
+  [[ "$url" == "https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/"*"V${version}-8G.zip" ]] \
+    || return 1
+  printf '%s\t%s\n' "$version" "$url"
+}
+
+validate_archive() {
+  local archive="$1" version="$2" image="$3" entry count size
+  unzip -tqq "$archive" >/dev/null 2>&1 || return 1
+  entry="$(LC_ALL=C unzip -Z1 "$archive" | LC_ALL=C grep -E '(^|/)HIFIEC[0-9]+\.IMG$' | head -n 1)"
+  count="$(LC_ALL=C unzip -Z1 "$archive" | LC_ALL=C grep -Ec '(^|/)HIFIEC[0-9]+\.IMG$' || true)"
+  [[ "$count" == 1 && "$entry" == *"V${version}-8G"* ]] || return 1
+  unzip -p "$archive" "$entry" > "$image"
+  size="$(file_size "$image")"
+  ((size >= 16777216 && size <= 67108864)) || return 1
+  printf '%s\n' "${entry##*/}"
+}
+
+bump_plugin_patch() {
+  local version major minor patch next temporary
+  version="$(sed -n 's/.*"version": "\([0-9][0-9.]*\)".*/\1/p' "$manifest_file" | head -n 1)"
+  [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+  next="$major.$minor.$((10#$patch + 1))"
+  temporary="$(mktemp "${manifest_file}.XXXXXX")"
+  sed "s/\"version\": \"$version\"/\"version\": \"$next\"/" "$manifest_file" > "$temporary"
+  mv "$temporary" "$manifest_file"
+  printf '%s\n' "$next"
+}
+
+record_firmware() {
+  local version="$1" url="$2" archive="$3" workdir="$4"
+  local archive_hash image image_name image_hash line existing plugin_version temporary
+  archive_hash="$(sha256sum "$archive" | awk '{ print $1 }')"
+  image="$workdir/firmware.IMG"
+  image_name="$(validate_archive "$archive" "$version" "$image")"
+  image_hash="$(sha256sum "$image" | awk '{ print $1 }')"
+  line="$version"$'\t'"$url"$'\t'"$archive_hash"$'\t'"$image_hash"$'\t'"$image_name"
+  existing="$(awk -F '\t' -v version="$version" '$1 == version { print }' "$trust_file")"
+  if [[ -n "$existing" ]]; then
+    [[ "$existing" == "$line" ]] \
+      || { echo "Firmware $version differs from its pinned metadata" >&2; return 1; }
+    echo "Firmware $version already trusted"
+    return
+  fi
+  temporary="$(mktemp "${trust_file}.XXXXXX")"
+  { cat "$trust_file"; printf '%s\n' "$line"; } > "$temporary"
+  mv "$temporary" "$trust_file"
+  plugin_version="$(bump_plugin_patch)"
+  echo "Pinned firmware $version · Echo Shelf $plugin_version"
+}
+
+check_firmware() {
+  local workdir page metadata version url archive
+  workdir="$(mktemp -d)"
+  trap "rm -r -- '$workdir'" RETURN
+  page="$(curl -LfsS --proto '=https' --tlsv1.2 --max-time 30 "$firmware_page")"
+  metadata="$(latest_from_page "$page")"
+  IFS=$'\t' read -r version url <<<"$metadata"
+  archive="$workdir/firmware.zip"
+  curl -fsS --proto '=https' --tlsv1.2 --max-time 180 "$url" -o "$archive"
+  record_firmware "$version" "$url" "$archive" "$workdir"
+  rm -r -- "$workdir"
+  trap - RETURN
+}
+
+self_test() {
+  local test_root archive page output expected_archive_hash expected_image_hash
+  test_root="$(mktemp -d)"
+  trap "rm -r -- '$test_root'" EXIT
+  mkdir -p "$test_root/package/ECHO MINI V9.9.9-8G"
+  dd if=/dev/zero of="$test_root/package/ECHO MINI V9.9.9-8G/HIFIEC99.IMG" \
+    bs=1048576 count=16 status=none
+  archive="$test_root/firmware.zip"
+  (cd "$test_root/package" && zip -q "$archive" 'ECHO MINI V9.9.9-8G/HIFIEC99.IMG')
+  page='<p>ECHO MINI firmware V9.9.9</p><a href="https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V9.9.9-8G.zip">Download</a>'
+  [[ "$(latest_from_page "$page")" == $'9.9.9\thttps://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V9.9.9-8G.zip' ]]
+  ! latest_from_page "${page/https:\/\/fiio-firmware.oss-us-west-1.aliyuncs.com/http:\/\/example.com}"
+  trust_file="$test_root/firmware-trust.tsv"
+  manifest_file="$test_root/manifest.json"
+  printf '# version\tarchive_url\tarchive_sha256\timage_sha256\timage_name\n' > "$trust_file"
+  printf '{ "version": "1.2.3" }\n' > "$manifest_file"
+  output="$(record_firmware 9.9.9 \
+    'https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V9.9.9-8G.zip' \
+    "$archive" "$test_root")"
+  [[ "$output" == 'Pinned firmware 9.9.9 · Echo Shelf 1.2.4' ]]
+  expected_archive_hash="$(sha256sum "$archive" | awk '{ print $1 }')"
+  expected_image_hash='080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e'
+  grep -Fqx $'9.9.9\thttps://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V9.9.9-8G.zip\t'"$expected_archive_hash"$'\t'"$expected_image_hash"$'\tHIFIEC99.IMG' "$trust_file"
+  grep -Fq '"version": "1.2.4"' "$manifest_file"
+  [[ "$(record_firmware 9.9.9 \
+    'https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V9.9.9-8G.zip' \
+    "$archive" "$test_root")" == 'Firmware 9.9.9 already trusted' ]]
+  printf changed >> "$archive"
+  ! record_firmware 9.9.9 \
+    'https://fiio-firmware.oss-us-west-1.aliyuncs.com/ECHO%20MINI/ECHO%20MINI%20V9.9.9-8G.zip' \
+    "$archive" "$test_root" >/dev/null 2>&1
+  echo 'Firmware update checker self-test passed'
+  rm -r -- "$test_root"
+  trap - EXIT
+}
+
+case "${1:---check}" in
+  --check) check_firmware ;;
+  --self-test) self_test ;;
+  *) echo "Usage: ${0##*/} [--check|--self-test]" >&2; exit 2 ;;
+esac

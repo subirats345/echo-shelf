@@ -8,7 +8,7 @@ A small Omarchy Quattro bar widget for the Snowsky Echo Mini: connection and sto
 
 - `Overview` — USB Data or DAC state, independent internal/SD mount state, occupied/total storage, usage percentage, and safe eject.
 - `Library` — track and album counts, a one-click Inbox, structured send/import status, and a direct path to review preserved conflicts.
-- `Firmware` — the installed version. Update controls appear only when action is required.
+- `Firmware` — the installed version, automatic and manual update checks, and controls only when action is required.
 - The bar icon disappears when the player is disconnected.
 - Cached details appear immediately while a fingerprinted background refresh runs.
 
@@ -63,7 +63,9 @@ Local import conflicts are never overwritten or called up to date. Echo Shelf re
 
 ## Firmware
 
-Echo Shelf checks FiiO's official Echo Mini firmware page every six hours and caches the result. Preparing an update requires a clean Library import, validates the official 8 GB archive and image structure, records SHA-256 hashes for copy integrity, and completes a marked internal-storage backup before any firmware copy. FiiO does not currently publish an independent package checksum, so Echo Shelf does not claim vendor-signature verification.
+Echo Shelf checks FiiO's official Echo Mini firmware page every six hours and caches the result. Preparing an update requires a clean Library import, an exact URL and SHA-256 allowlisted by the installed Echo Shelf release, validation of the 8 GB archive and image structure, and a completed internal-storage backup before any firmware copy. A future firmware version cannot be installed until a new Echo Shelf release pins its URL, archive hash, image name, and image hash. FiiO does not publish a signature or independent checksum, so this is maintainer-pinned trust rather than vendor-signature verification.
+
+A daily GitHub workflow detects new official packages, validates their structure, calculates both hashes, bumps the plugin patch version, and opens a review PR. It never merges or authorizes firmware automatically: confirming the official announcement and merging that PR is the maintainer's trust decision.
 
 Install remains a deliberate physical flow: safely eject, disconnect, remove the SD card, reconnect in USB Data, install, restart the Echo, then confirm the version shown on the player. Every write step requires explicit confirmation.
 
@@ -92,6 +94,7 @@ Install remains a deliberate physical flow: safely eject, disconnect, remove the
 
 ```bash
 ./echo-mini-status --self-test
+./scripts/check-firmware-update --self-test
 omarchy plugin validate .
 qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml BarWidget.qml
 ```
