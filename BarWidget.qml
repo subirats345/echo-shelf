@@ -256,6 +256,10 @@ Panel {
     firmwareConfirmProbe.running = true
   }
 
+  function requestUpdateCheck() {
+    if (!updateProbe.running) updateProbe.running = true
+  }
+
   function switchTab(step) {
     var tabs = ["overview", "library", "firmware"]
     var index = tabs.indexOf(activeTab)
@@ -266,7 +270,7 @@ Panel {
   function tabActions() {
     if (activeTab === "overview") return [ejectRow]
     if (activeTab === "library") return [inboxRow, syncRow, importRow]
-    return [firmwareConfirmButton, firmwarePrepareButton, firmwareInstallButton]
+    return [firmwareCheckRow, firmwareConfirmButton, firmwarePrepareButton, firmwareInstallButton]
   }
 
   function focusFirstAction(direction) {
@@ -284,7 +288,7 @@ Panel {
 
   function actionFocusActive() {
     var actions = [ejectRow, inboxRow, syncRow, importRow,
-      firmwareConfirmButton, firmwarePrepareButton, firmwareInstallButton]
+      firmwareCheckRow, firmwareConfirmButton, firmwarePrepareButton, firmwareInstallButton]
     for (var i = 0; i < actions.length; i++) {
       var target = actions[i]
       if (target && (target.actionHasFocus || target.activeFocus)) return true
@@ -476,7 +480,7 @@ Panel {
     running: root.visible
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!updateProbe.running) updateProbe.running = true
+    onTriggered: root.requestUpdateCheck()
   }
 
   Timer {
@@ -738,6 +742,16 @@ Panel {
               label: "Installed"
               value: root.details.firmware_installed === "unknown" ? "Unknown" : root.details.firmware_installed || "—"
               caption: root.firmwareSummary()
+            }
+
+            ActionRow {
+              id: firmwareCheckRow
+              width: parent.width
+              label: "Updates"
+              caption: updateProbe.running ? "Checking official source…" : "Official firmware source"
+              buttonText: updateProbe.running ? "Checking" : "Check"
+              enabled: root.mode !== "error" && !root.actionRunning && !updateProbe.running
+              onTriggered: root.requestUpdateCheck()
             }
 
             PanelSeparator {

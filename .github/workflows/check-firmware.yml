@@ -1,0 +1,65 @@
+name: Check Echo Mini firmware
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: echo-mini-firmware-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check official firmware
+        id: firmware
+        shell: bash
+        run: |
+          ./scripts/check-firmware-update --check
+          version="$(awk -F '\t' '!/^#/ { version=$1 } END { print version }' firmware-trust.tsv)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- firmware-trust.tsv manifest.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open review pull request
+        if: steps.firmware.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.firmware.outputs.version }}
+        shell: bash
+        run: |
+          branch="automation/echo-mini-firmware-$VERSION"
+          if gh pr list --state all --head "$branch" --json number --jq 'length > 0' | grep -qx true; then
+            echo "A pull request for $VERSION already exists"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$branch"
+          git add firmware-trust.tsv manifest.json
+          git commit -m "Trust Echo Mini firmware $VERSION"
+          git push origin "$branch"
+          metadata="$(awk -F '\t' -v version="$VERSION" '$1 == version { print }' firmware-trust.tsv)"
+          IFS=$'\t' read -r _ url archive_hash image_hash image_name <<<"$metadata"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Trust Echo Mini firmware $VERSION" \
+            --body "$(printf '%s\n\n%s\n%s\n%s\n%s\n\n%s\n' \
+              'Automated candidate from the official FiiO page. This PR must be reviewed and merged by a human; the source is unsigned and mutable.' \
+              "- Source: $url" \
+              "- Archive SHA-256: \`$archive_hash\`" \
+              "- Image: \`$image_name\`" \
+              "- Image SHA-256: \`$image_hash\`" \
+              'Before merging, confirm the firmware announcement and URL independently. Merging this PR is the trust decision.')"
