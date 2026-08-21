@@ -110,10 +110,10 @@ qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml BarWidget.qml
 omarchy plugin remove io.github.subirats345.echo-shelf
 ```
 
-Removal leaves your Inbox, imported Library, firmware backups, and cached/configured state untouched.
+Removal leaves your Echo Shelf music folders, firmware backups, and cached/configured state untouched.
 
 ## License
 
-The plugin code is available under the [MIT License](LICENSE). `media-tape.svg` comes from the GNOME HighContrast icon theme and remains under LGPL-2.1-only; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The plugin code is available under the [MIT License](LICENSE).
 
-Snowsky, Echo Mini, FiiO, Omarchy, and GNOME are trademarks or projects of their respective owners. This community plugin is not affiliated with or endorsed by them.
+Snowsky, Echo Mini, FiiO, and Omarchy are trademarks or projects of their respective owners. This community plugin is not affiliated with or endorsed by them.

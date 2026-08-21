@@ -847,17 +847,34 @@ Panel {
   }
 
   component EchoGlyph: Item {
+    id: echoGlyph
     property real iconSize: Style.font.icon
     property color color: root.foreground
     implicitWidth: iconSize
     implicitHeight: iconSize
-    Image {
-      anchors.fill: parent
-      source: "media-tape.svg"
-      sourceSize.width: 48
-      sourceSize.height: 48
-      fillMode: Image.PreserveAspectFit
-      smooth: true
+
+    readonly property real bodyHeight: iconSize * 0.68
+
+    Rectangle {
+      width: echoGlyph.iconSize
+      height: echoGlyph.bodyHeight
+      anchors.centerIn: parent
+      radius: height * 0.12
+      color: "transparent"
+      border.color: echoGlyph.color
+      border.width: Math.max(1, echoGlyph.iconSize * 0.08)
+
+      Rectangle {
+        height: parent.height * 0.30
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: parent.width * 0.23
+        anchors.rightMargin: parent.width * 0.23
+        anchors.top: parent.top
+        anchors.topMargin: parent.height * 0.20
+        radius: Math.max(1, height * 0.08)
+        color: echoGlyph.color
+      }
     }
   }
 
