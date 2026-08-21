@@ -2,13 +2,14 @@
 
 A small Omarchy Quattro bar widget for the Snowsky Echo Mini: connection and storage at a glance, non-destructive music transfer, safe eject, and a guided firmware flow.
 
-![Overview, Library, and Firmware tabs](docs/tabs.png)
+![Overview, Music, and Firmware tabs](docs/tabs.png)
 
 ## What it shows
 
 - `Overview` — USB Data or DAC state, independent internal/SD mount state, occupied/total storage, usage percentage, and safe eject.
-- `Library` — track and album counts, a one-click Inbox, structured send/import status, and a direct path to review preserved conflicts.
+- `Music` — track and album counts plus two explicit flows: music copied to the Echo and a local copy brought back from it.
 - `Firmware` — the installed version, automatic and manual update checks, and controls only when action is required.
+- In USB DAC mode the panel collapses to audio-only status; tabs and device-management actions appear only in USB Data mode.
 - The bar icon disappears when the player is disconnected.
 - Cached details appear immediately while a fingerprinted background refresh runs.
 
@@ -46,10 +47,14 @@ If Omarchy updates the files but the widget does not reload cleanly, run `omarch
 
 ## Music transfer
 
-Echo Shelf creates these folders when needed:
+Echo Shelf groups both music folders under one directory:
 
-- `~/Music/Echo Shelf Inbox` — add music here, then use **Send to Echo**.
-- `~/Music/Echo Shelf Library` — receives missing music from **Import from Echo**.
+- `~/Music/Echo Shelf/To Echo` — staging area for **computer → Echo**. Add music here, then use **Copy to Echo**.
+- `~/Music/Echo Shelf/Local Copy` — local safety copy for **Echo → computer**. Echo Shelf never sends music from this folder.
+
+Existing `Echo Shelf Inbox` and `Echo Shelf Library` folders are moved into this grouped layout automatically when there is no destination conflict.
+
+Firmware backups are separate from music and live in `~/.local/share/echo-shelf/firmware-backups`. Echo Shelf moves the old `~/Music/Echo Shelf Firmware Backups` folder there automatically when there is no destination conflict.
 
 The expected player layout is:
 
@@ -83,7 +88,7 @@ Install remains a deliberate physical flow: safely eject, disconnect, remove the
 | Key | Action |
 | --- | --- |
 | `o` / `1` | Overview |
-| `l` / `2` | Library |
+| `m` / `l` / `2` | Music |
 | `f` / `3` | Firmware |
 | `←` / `→` | Previous or next tab |
 | `Tab` / `Shift+Tab` | Focus available actions |
@@ -105,10 +110,10 @@ qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml BarWidget.qml
 omarchy plugin remove io.github.subirats345.echo-shelf
 ```
 
-Removal leaves your Inbox, imported Library, firmware backups, and cached/configured state untouched.
+Removal leaves your Echo Shelf music folders, firmware backups, and cached/configured state untouched.
 
 ## License
 
-The plugin code is available under the [MIT License](LICENSE). `media-tape.svg` comes from the GNOME HighContrast icon theme and remains under LGPL-2.1-only; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The plugin code is available under the [MIT License](LICENSE).
 
-Snowsky, Echo Mini, FiiO, Omarchy, and GNOME are trademarks or projects of their respective owners. This community plugin is not affiliated with or endorsed by them.
+Snowsky, Echo Mini, FiiO, and Omarchy are trademarks or projects of their respective owners. This community plugin is not affiliated with or endorsed by them.
